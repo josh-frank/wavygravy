@@ -1,0 +1,7 @@
+# `wavygravy`
+
+> **For lawful use only:** In the US that includes education, research, and testing, with audio you own or are authorized to modify. To the fullest extent permitted by applicable law: this software is provided “as is” without warranty of any kind, and its authors/contributors disclaim liability for damages or claims arising from its use. This notice is not legal advice and does not guarantee that any particular use is lawful; consult a qualified attorney about your circumstances. You are responsible for ensuring that your use complies with applicable national and local laws and regulations.
+
+> **Radio transmissions:** Do not transmit output from this software unless you are authorized to use the relevant service, frequency, and equipment, and comply with applicable Federal Communications Commission (FCC) rules. Amateur-radio operators in the US should review 47 C.F.R. Part 97, including § 97.113, which prohibits messages encoded for the purpose of obscuring their meaning, except as otherwise permitted by the rule. This software is not represented as compliant with amateur-radio or other radio-service requirements.
+
+> **Audio and content:** You are responsible for having the necessary rights and permissions to modify, reproduce, or transmit any audio or other content you use. Do not use the software to violate another person’s rights, facilitate unlawful conduct, interfere with communications, or evade lawful restrictions.
