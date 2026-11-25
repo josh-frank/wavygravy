@@ -1,6 +1,5 @@
 /*
- * wavygravy.c -- straight C translation of wavygravy.py
- *                hide a short UTF-8 message in an audio file, recoverable
+ * wavygravy.c -- hide a short UTF-8 message in an audio file, recoverable
  *                after telephone / HAM-radio grade degradation.
  *
  * Single file, no third-party dependencies (libc + libm + POSIX only).
