@@ -3,8 +3,8 @@
 # wavygravy.py — hide a short UTF-8 message in an audio file using self-locating
 # "ping" beacons and a repeating carousel of coded chunks. (v0 / lean draft)
 #
-#   KOMETA_PASSWORD=... wavygravy.py encode  cover.wav "stop spying on me" out.wav
-#   KOMETA_PASSWORD=... wavygravy.py decode  out.wav [message.txt]
+#   WAVYGRAVY_PASSWORD=... wavygravy.py encode  cover.wav "stop spying on me" out.wav
+#   WAVYGRAVY_PASSWORD=... wavygravy.py decode  out.wav [message.txt]
 #                       wavygravy.py capacity cover.wav
 #
 # Design, in one paragraph:
@@ -74,6 +74,7 @@ LEG_SEARCH    = 40                            # samples, fine-align search windo
 REDUNDANCY    = {"low": 128, "medium": 256, "high": 512}   # samples per data bit
 LEN_BYTES     = 4
 SALT_BYTES    = 6
+MAX_MESSAGE_BYTES = 16 * 1024          # see note at the nslots/max_seen guard below
 HDR_BYTES     = LEN_BYTES + SALT_BYTES
 TAG_BYTES     = 16
 ENV_WIN       = 400
@@ -427,12 +428,19 @@ def _decode_with_L(xn, xa, pings, ck, L, password, log):
     header = fec_decode(accum[0])
     n = int.from_bytes(header[:LEN_BYTES], "big")
     salt = header[LEN_BYTES:HDR_BYTES]
-    nslots = n_payload_slots(n)
     # A garbage header (wrong redundancy / wrong password) can claim an
     # enormous message length, which would blow up the soft-bit array and
-    # Viterbi's trellis below. But a genuine message can never need more
-    # payload slots than we've actually seen *some* data for — so bail the
-    # instant the claim exceeds what was observed, before allocating anything.
+    # Viterbi's trellis below. Two guards, cheapest first:
+    #  1. A flat sanity cap — this is a short-text tool, not a file-transfer
+    #     one, so reject anything absurd before computing slot counts at all.
+    #  2. The real safety bound: a genuine message can never need more
+    #     payload slots than we've actually seen *some* data for, so bail
+    #     the instant the claim exceeds what was physically observed in
+    #     this recording — this is what actually keeps memory use bounded
+    #     by file size no matter what MAX_MESSAGE_BYTES is set to.
+    if n < 0 or n > MAX_MESSAGE_BYTES:
+        return None
+    nslots = n_payload_slots(n)
     max_seen = max((s for s in accum if s > 0), default=0)
     if nslots < 0 or nslots > max_seen:
         return None
@@ -472,7 +480,7 @@ def decode_audio(x, fs, password, band=DEFAULT_BAND, verbose=False):
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def get_password(confirm=False):
-    pw = os.environ.get("KOMETA_PASSWORD")
+    pw = os.environ.get("WAVYGRAVY_PASSWORD")
     if pw:
         return pw
     pw = getpass.getpass("password: ")
@@ -531,7 +539,7 @@ def main(argv=None):
         if a.cmd == "encode":
             fs, cover = read_audio(a.cover)
             msg = open(a.message, "rb").read() if os.path.isfile(a.message) else a.message.encode("utf-8")
-            pw = get_password(confirm=sys.stdin.isatty() and "KOMETA_PASSWORD" not in os.environ)
+            pw = get_password(confirm=sys.stdin.isatty() and "WAVYGRAVY_PASSWORD" not in os.environ)
             out = encode_audio(cover, fs, msg, pw, a.redundancy, a.strength, band)
             write_audio(a.output, fs, out)
             print(f"encoded {len(msg)} bytes -> {a.output}", file=sys.stderr)
