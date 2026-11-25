@@ -362,6 +362,134 @@ def test_default_strength_on_white_noise_cover_always_decodes(monkeypatch):
     assert not failures, f"salts that failed to decode: {failures}"
 
 
+# ── partial recovery: windows cut out of the output ─────────────────────────
+# At "low" redundancy a frame is 26016 samples (3.25 s). A decoder window must hold
+# one lap-opening (boundary) ping plus every slot after it. A message of <= 4 bytes
+# needs 1 header + 2 payload slots = 3 slots per lap, so any half of a 40 s file
+# (>= 5 whole frames wherever it is cut) is guaranteed to contain one complete lap.
+
+SMALL_MESSAGE = b"help"                                  # 4 bytes -> 3-slot carousel
+HALF_STARTS_S = [0.0, 0.4, 1.7, 3.3, 5.0, 7.9, 10.0, 13.7, 16.1, 19.99]   # cut offsets, seconds
+
+
+@pytest.fixture(scope="module")
+def small_out(tmp, cover_path):
+    path = encode_to_file(cover_path, tmp / "small_out.wav", message=SMALL_MESSAGE)
+    return wg.read_audio(path)                           # (fs, float array)
+
+
+@pytest.mark.parametrize("start_s", HALF_STARTS_S)
+def test_small_message_recovered_from_half_length_window(small_out, start_s):
+    fs, x = small_out
+    half = len(x) // 2
+    a = int(start_s * fs)
+    window = x[a:a + half]
+    assert len(window) == half
+    assert wg.decode_audio(window, fs, PASSWORD) == SMALL_MESSAGE
+
+
+def test_small_message_recovered_from_random_half_windows(small_out):
+    fs, x = small_out
+    half = len(x) // 2
+    rng = np.random.default_rng(42)                      # seeded: reproducible "random" cuts
+    for a in rng.integers(0, len(x) - half + 1, size=6):
+        assert wg.decode_audio(x[a:a + half], fs, PASSWORD) == SMALL_MESSAGE, f"start sample {a}"
+
+
+def test_both_halves_decode_independently(small_out):
+    fs, x = small_out
+    half = len(x) // 2
+    assert wg.decode_audio(x[:half], fs, PASSWORD) == SMALL_MESSAGE
+    assert wg.decode_audio(x[half:], fs, PASSWORD) == SMALL_MESSAGE
+
+
+def test_large_message_not_recoverable_from_second_half(out_a_path):
+    """Limit check: the 17-byte message needs 5 slots per lap, and the second half of the
+    40 s file holds a boundary ping with too few frames after it. Must fail cleanly."""
+    fs, x = wg.read_audio(out_a_path)
+    with pytest.raises(wg.WavyError):
+        wg.decode_audio(x[len(x) // 2:], fs, PASSWORD)
+
+
+def test_ten_second_window_is_too_short_to_decode(small_out):
+    """10 s is ~3 frames at low redundancy; cut away from a frame boundary it cannot hold
+    a boundary ping plus a full 3-slot lap, so it must fail cleanly (never a wrong message)."""
+    fs, x = small_out
+    a = int(5.0 * fs)
+    with pytest.raises(wg.WavyError):
+        wg.decode_audio(x[a:a + 10 * fs], fs, PASSWORD)
+
+
+# ── password-free (null password) mode ───────────────────────────────────────
+
+@pytest.fixture(scope="module")
+def nopw_path(tmp, cover_path):
+    fs, cov = wg.read_audio(cover_path)
+    out = wg.encode_audio(cov, fs, SMALL_MESSAGE, None, RED, STRENGTH)
+    path = str(tmp / "nopw.wav")
+    wg.write_audio(path, fs, out)
+    return path
+
+
+@pytest.mark.parametrize("pw", [None, ""])
+def test_null_password_roundtrip(nopw_path, pw):
+    """None and "" are interchangeable: encoded with None, decodes with either."""
+    assert decode_file(nopw_path, pw) == SMALL_MESSAGE
+
+
+def test_null_password_file_rejects_real_password(nopw_path):
+    with pytest.raises(wg.WavyError):
+        decode_file(nopw_path, PASSWORD)
+
+
+def test_password_file_rejects_null_password(out_a_path):
+    with pytest.raises(wg.WavyError):
+        decode_file(out_a_path, None)
+    with pytest.raises(wg.WavyError):
+        decode_file(out_a_path, "")
+
+
+def test_null_password_empty_string_encode_decodes_with_none(tmp, cover_path):
+    op = encode_to_file(cover_path, tmp / "nopw_empty.wav", message=SMALL_MESSAGE, password="")
+    assert decode_file(op, None) == SMALL_MESSAGE
+
+
+def test_null_password_still_salted_so_outputs_differ(cover):
+    fs, cov = cover
+    a = wg.encode_audio(cov, fs, SMALL_MESSAGE, None, RED, STRENGTH)
+    b = wg.encode_audio(cov, fs, SMALL_MESSAGE, None, RED, STRENGTH)
+    assert not np.array_equal(a, b)
+    assert wg.decode_audio(a, fs, None) == SMALL_MESSAGE
+    assert wg.decode_audio(b, fs, None) == SMALL_MESSAGE
+
+
+def test_null_password_works_from_half_window(nopw_path):
+    fs, x = wg.read_audio(nopw_path)
+    half = len(x) // 2
+    assert wg.decode_audio(x[3 * fs:3 * fs + half], fs, None) == SMALL_MESSAGE
+
+
+def test_cli_no_password_roundtrip(tmp, cover_path, monkeypatch, capfd):
+    monkeypatch.delenv("WAVYGRAVY_PASSWORD", raising=False)
+    out = str(tmp / "cli_nopw.wav")
+    assert wg.main(["encode", "--no-password", cover_path, "hello", out,
+                    "--redundancy", RED, "--strength", str(STRENGTH)]) == 0
+    assert "no password" in capfd.readouterr().err
+    assert wg.main(["decode", "--no-password", out]) == 0
+    assert capfd.readouterr().out == "hello"
+
+
+def test_cli_no_password_conflicts_with_env_password(out_a_path, monkeypatch, capsys):
+    monkeypatch.setenv("WAVYGRAVY_PASSWORD", PASSWORD)
+    assert wg.main(["decode", "--no-password", out_a_path]) == 1
+    assert "conflicts" in capsys.readouterr().err
+
+
+def test_cli_decode_without_flag_on_password_free_file_fails(nopw_path, monkeypatch, capsys):
+    monkeypatch.setenv("WAVYGRAVY_PASSWORD", PASSWORD)
+    assert wg.main(["decode", nopw_path]) == 1
+
+
 # ── FEC unit tests (fast, no audio) ──────────────────────────────────────────
 
 def test_fec_roundtrip_clean():

@@ -5,6 +5,8 @@
 #
 #   WAVYGRAVY_PASSWORD=... wavygravy.py encode  cover.wav "stop spying on me" out.wav
 #   WAVYGRAVY_PASSWORD=... wavygravy.py decode  out.wav [message.txt]
+#   wavygravy.py encode --no-password cover.wav "hello" out.wav   (password-free)
+#   wavygravy.py decode --no-password out.wav
 #                       wavygravy.py capacity cover.wav
 #
 # Design, in one paragraph:
@@ -89,8 +91,15 @@ class WavyError(Exception):
 
 # ── keys & keyed pseudo-randomness ───────────────────────────────────────────
 
+def _pw(password):
+    """None and "" both mean 'no password'. The keys are then derived from an
+    empty string, i.e. they are public: the message is still FEC-coded and
+    integrity-checked, but anyone with this tool can find and read it. Use for
+    non-adversarial hiding only."""
+    return b"" if password is None else password.encode()
+
 def carrier_key(password):
-    return hashlib.scrypt(password.encode(), salt=b"wavygravy/carrier/v1",
+    return hashlib.scrypt(_pw(password), salt=b"wavygravy/carrier/v1",
                           n=KDF_N, r=8, p=1, dklen=32)
 
 def subkey(ck, label):
@@ -106,7 +115,7 @@ def keyed_bits(key32, n):
     return np.unpackbits(ks)[:n]
 
 def msg_key(password, salt):
-    return hashlib.scrypt(password.encode(), salt=salt, n=KDF_N, r=8, p=1, dklen=32)
+    return hashlib.scrypt(_pw(password), salt=salt, n=KDF_N, r=8, p=1, dklen=32)
 
 # ── DSP helpers ──────────────────────────────────────────────────────────────
 
@@ -491,7 +500,11 @@ def decode_audio(x, fs, password, band=DEFAULT_BAND, verbose=False):
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
-def get_password(confirm=False):
+def get_password(confirm=False, no_password=False):
+    if no_password:
+        if os.environ.get("WAVYGRAVY_PASSWORD"):
+            raise WavyError("--no-password conflicts with WAVYGRAVY_PASSWORD (unset one of them)")
+        return ""
     pw = os.environ.get("WAVYGRAVY_PASSWORD")
     if pw:
         return pw
@@ -499,7 +512,7 @@ def get_password(confirm=False):
     if confirm and getpass.getpass("again:    ") != pw:
         raise WavyError("passwords do not match")
     if not pw:
-        raise WavyError("empty password")
+        raise WavyError("empty password (use --no-password for password-free mode)")
     return pw
 
 def parse_band(s):
@@ -517,6 +530,8 @@ def main(argv=None):
     def common(p):
         p.add_argument("--band", default="300-2700", help="carrier band in Hz (must match on decode)")
         p.add_argument("-v", "--verbose", action="store_true")
+        p.add_argument("--no-password", action="store_true",
+                       help="no password: anyone with this tool can decode (must match on decode)")
 
     e = sub.add_parser("encode", help="encode <cover.wav> <message|file> <output.wav>")
     e.add_argument("cover"); e.add_argument("message"); e.add_argument("output")
@@ -556,14 +571,17 @@ def main(argv=None):
         if a.cmd == "encode":
             fs, cover = read_audio(a.cover)
             msg = open(a.message, "rb").read() if os.path.isfile(a.message) else a.message.encode("utf-8")
-            pw = get_password(confirm=sys.stdin.isatty() and "WAVYGRAVY_PASSWORD" not in os.environ)
+            pw = get_password(confirm=sys.stdin.isatty() and "WAVYGRAVY_PASSWORD" not in os.environ,
+                              no_password=a.no_password)
             out = encode_audio(cover, fs, msg, pw, a.redundancy, a.strength, band)
             write_audio(a.output, fs, out)
-            print(f"encoded {len(msg)} bytes -> {a.output}", file=sys.stderr)
+            print(f"encoded {len(msg)} bytes -> {a.output}"
+                  + (" (no password: readable by anyone with this tool)" if a.no_password else ""),
+                  file=sys.stderr)
             return 0
 
         fs, x = read_audio(a.input)
-        msg = decode_audio(x, fs, get_password(), band, a.verbose)
+        msg = decode_audio(x, fs, get_password(no_password=a.no_password), band, a.verbose)
         if a.output:
             open(a.output, "wb").write(msg)
         else:
