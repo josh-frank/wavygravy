@@ -404,10 +404,18 @@ def _decode_with_L(xn, xa, pings, ck, L, password, log):
 
         corr = ping_corrections(xa, start, boundary)
         if corr is None:
+            # LEG_SEARCH's fixed +-40 sample window didn't find a usable
+            # leg alignment near this ping (more clock drift than that
+            # window tolerates, most likely). This frame's data is simply
+            # skipped this lap rather than demodulated with a bad fix --
+            # the carousel should pick it up again next time around, but
+            # it's worth knowing this happened rather than it being silent.
+            log(f"  slot {slot_id}: no leg alignment near sample {start} (LEG_SEARCH window too narrow?), skipping this lap")
             continue
         data_start, delta_hz, theta0 = corr
         need = SYMS_PER_FRAME * L
         if data_start < 0 or data_start + need > len(xa):
+            log(f"  slot {slot_id}: data field at sample {data_start} runs off the end of the recording, skipping")
             continue
 
         carrier_a = signal.hilbert(slot_carrier(ck, slot_id, need, (DEFAULT_BAND)))
@@ -468,14 +476,18 @@ def decode_audio(x, fs, password, band=DEFAULT_BAND, verbose=False):
     pings = find_pings(xn)
     log(f"  found {len(pings)} candidate ping(s)")
     if not pings:
-        raise WavyError("no ping beacons found (wrong --band, no watermark, or signal too degraded)")
+        raise WavyError(f"no ping beacons found in band {band[0]:.0f}-{band[1]:.0f} Hz "
+                        f"(wrong --band? this file may have none, or the signal is too degraded)")
     xa = signal.hilbert(xn)
     for name in ("medium", "high", "low"):
         L = REDUNDANCY[name]
         msg = _decode_with_L(xn, xa, pings, ck, L, password, log)
         if msg is not None:
             return msg
-    raise WavyError("no message found (wrong password, wrong --band, or the audio is too degraded)")
+    # Pings were found (so --band is almost certainly right, since that's
+    # what the beacon scan above just confirmed) but nothing decoded: the
+    # remaining explanations are a wrong password or payload-level damage.
+    raise WavyError("pings found but no message decoded (wrong password, or the payload is too degraded)")
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -530,9 +542,14 @@ def main(argv=None):
                 flen = frame_len_samples(L)
                 nframes = n8 // flen
                 cap = capacity_bytes(nframes, L)
+                if cap < 0:
+                    print(f"  {name:<6} ({flen / WORK_FS:4.1f}s/frame, {nframes:>4} frames): "
+                          f"too short even for the header (needs >= 1 frame)")
+                    continue
+                total_slots = 1 + n_payload_slots(cap)
+                laps = nframes // total_slots
                 print(f"  {name:<6} ({flen / WORK_FS:4.1f}s/frame, {nframes:>4} frames, "
-                      f"{nframes and nframes // max(1, 1 + n_payload_slots(max(cap,0)))} lap(s)): "
-                      f"{max(cap, 0)} bytes")
+                      f"{laps} lap(s)): {cap} bytes")
             return 0
 
         band = parse_band(a.band)
