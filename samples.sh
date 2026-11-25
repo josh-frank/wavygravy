@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# usage: WAVYGRAVY_PASSWORD=... ./samples.sh out.wav
+# use: WAVYGRAVY_PASSWORD=... ./samples.sh out.wav
 set -euo pipefail
 IN="${1:?usage: $0 encoded.wav}"
 
@@ -15,9 +15,10 @@ random_cut() {
 
 HALF=$(awk -v d="$DUR" 'BEGIN{printf "%.6f", d/2}')
 random_cut "$HALF" half.wav      # random half-length portion
+random_cut 30      sample30.wav  # random thirty-second sample
 random_cut 10      sample10.wav  # random ten-second sample
 
-for f in half.wav sample10.wav; do
+for f in half.wav sample30.wav sample10.wav; do
   printf '%s: ' "$f"
   python wavygravy.py decode "$f" 2>&1 || true
   echo

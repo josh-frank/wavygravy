@@ -420,6 +420,76 @@ def test_ten_second_window_is_too_short_to_decode(small_out):
         wg.decode_audio(x[a:a + 10 * fs], fs, PASSWORD)
 
 
+# ── password-free (null password) mode ───────────────────────────────────────
+
+@pytest.fixture(scope="module")
+def nopw_path(tmp, cover_path):
+    fs, cov = wg.read_audio(cover_path)
+    out = wg.encode_audio(cov, fs, SMALL_MESSAGE, None, RED, STRENGTH)
+    path = str(tmp / "nopw.wav")
+    wg.write_audio(path, fs, out)
+    return path
+
+
+@pytest.mark.parametrize("pw", [None, ""])
+def test_null_password_roundtrip(nopw_path, pw):
+    """None and "" are interchangeable: encoded with None, decodes with either."""
+    assert decode_file(nopw_path, pw) == SMALL_MESSAGE
+
+
+def test_null_password_file_rejects_real_password(nopw_path):
+    with pytest.raises(wg.WavyError):
+        decode_file(nopw_path, PASSWORD)
+
+
+def test_password_file_rejects_null_password(out_a_path):
+    with pytest.raises(wg.WavyError):
+        decode_file(out_a_path, None)
+    with pytest.raises(wg.WavyError):
+        decode_file(out_a_path, "")
+
+
+def test_null_password_empty_string_encode_decodes_with_none(tmp, cover_path):
+    op = encode_to_file(cover_path, tmp / "nopw_empty.wav", message=SMALL_MESSAGE, password="")
+    assert decode_file(op, None) == SMALL_MESSAGE
+
+
+def test_null_password_still_salted_so_outputs_differ(cover):
+    fs, cov = cover
+    a = wg.encode_audio(cov, fs, SMALL_MESSAGE, None, RED, STRENGTH)
+    b = wg.encode_audio(cov, fs, SMALL_MESSAGE, None, RED, STRENGTH)
+    assert not np.array_equal(a, b)
+    assert wg.decode_audio(a, fs, None) == SMALL_MESSAGE
+    assert wg.decode_audio(b, fs, None) == SMALL_MESSAGE
+
+
+def test_null_password_works_from_half_window(nopw_path):
+    fs, x = wg.read_audio(nopw_path)
+    half = len(x) // 2
+    assert wg.decode_audio(x[3 * fs:3 * fs + half], fs, None) == SMALL_MESSAGE
+
+
+def test_cli_no_password_roundtrip(tmp, cover_path, monkeypatch, capfd):
+    monkeypatch.delenv("WAVYGRAVY_PASSWORD", raising=False)
+    out = str(tmp / "cli_nopw.wav")
+    assert wg.main(["encode", "--no-password", cover_path, "hello", out,
+                    "--redundancy", RED, "--strength", str(STRENGTH)]) == 0
+    assert "no password" in capfd.readouterr().err
+    assert wg.main(["decode", "--no-password", out]) == 0
+    assert capfd.readouterr().out == "hello"
+
+
+def test_cli_no_password_conflicts_with_env_password(out_a_path, monkeypatch, capsys):
+    monkeypatch.setenv("WAVYGRAVY_PASSWORD", PASSWORD)
+    assert wg.main(["decode", "--no-password", out_a_path]) == 1
+    assert "conflicts" in capsys.readouterr().err
+
+
+def test_cli_decode_without_flag_on_password_free_file_fails(nopw_path, monkeypatch, capsys):
+    monkeypatch.setenv("WAVYGRAVY_PASSWORD", PASSWORD)
+    assert wg.main(["decode", nopw_path]) == 1
+
+
 # ── FEC unit tests (fast, no audio) ──────────────────────────────────────────
 
 def test_fec_roundtrip_clean():
