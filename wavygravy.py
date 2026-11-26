@@ -75,7 +75,7 @@ LEG_SEARCH    = 40                            # samples, fine-align search windo
 
 REDUNDANCY    = {"low": 128, "medium": 256, "high": 512}   # samples per data bit
 LEN_BYTES     = 4
-SALT_BYTES    = 6
+SALT_BYTES    = 8
 MAX_MESSAGE_BYTES = 16 * 1024          # see note at the nslots/max_seen guard below
 HDR_BYTES     = LEN_BYTES + SALT_BYTES
 TAG_BYTES     = 16
@@ -114,8 +114,15 @@ def keyed_bits(key32, n):
     ks = np.frombuffer(keystream(key32, (n + 7) // 8), dtype=np.uint8)
     return np.unpackbits(ks)[:n]
 
-def msg_key(password, salt):
-    return hashlib.scrypt(_pw(password), salt=salt, n=KDF_N, r=8, p=1, dklen=32)
+def msg_key_nonce(password, salt):
+    """Per-message AEAD key (32 B) and nonce (12 B), both derived from the
+    password and the random per-message salt via one scrypt call. Neither is
+    transmitted: the header carries only the salt. Safety invariant: the
+    (key, nonce) pair is unique per message because the salt is. A salt
+    collision under the same password would reuse both, hence the salt must
+    stay random (os.urandom) and not be shortened."""
+    km = hashlib.scrypt(_pw(password), salt=salt, n=KDF_N, r=8, p=1, dklen=44)
+    return km[:32], km[32:]
 
 # ── DSP helpers ──────────────────────────────────────────────────────────────
 
@@ -367,7 +374,8 @@ def encode_audio(cover, fs, message, password, redundancy="medium",
 
     salt = os.urandom(SALT_BYTES)
     header = n.to_bytes(LEN_BYTES, "big") + salt
-    ct = ChaCha20Poly1305(msg_key(password, salt)).encrypt(bytes(12), message, header)
+    key, nonce = msg_key_nonce(password, salt)
+    ct = ChaCha20Poly1305(key).encrypt(nonce, message, header)
     ck = carrier_key(password)
 
     hdr_bits = fec_encode(header)                              # exactly SYMS_PER_FRAME
@@ -473,7 +481,8 @@ def _decode_with_L(xn, xa, pings, ck, L, password, log):
     ct = fec_decode(soft[:pbits])
     log(f"  L={L}: header len={n} salt={salt.hex()} slots seen={sorted(accum)}")
     try:
-        return ChaCha20Poly1305(msg_key(password, salt)).decrypt(bytes(12), bytes(ct), bytes(header))
+        key, nonce = msg_key_nonce(password, salt)
+        return ChaCha20Poly1305(key).decrypt(nonce, bytes(ct), bytes(header))
     except InvalidTag:
         return None
 
