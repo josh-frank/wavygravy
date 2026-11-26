@@ -1,53 +1,29 @@
 #!/usr/bin/env python3
 # ─────────────────────────────────────────────────────────────────────────────
 # wavygravy.py — hide a short UTF-8 message in an audio file using self-locating
-# "ping" beacons and a repeating carousel of coded chunks. (v0 / lean draft)
+# "ping" beacons and a repeating carousel of coded chunks.
 #
-#   WAVYGRAVY_PASSWORD=... wavygravy.py encode  cover.wav "stop spying on me" out.wav
-#   WAVYGRAVY_PASSWORD=... wavygravy.py decode  out.wav [message.txt]
+#   WAVYGRAVY_PASSWORD=... wavygravy.py encode cover.wav "stop spying on me" out.wav
+#   WAVYGRAVY_PASSWORD=... wavygravy.py decode out.wav [message.txt]
 #   wavygravy.py encode --no-password cover.wav "hello" out.wav   (password-free)
 #   wavygravy.py decode --no-password out.wav
-#                       wavygravy.py capacity cover.wav
+#   wavygravy.py capacity cover.wav
 #
-# Design, in one paragraph:
-#   The timeline is cut into FRAMES. Each frame starts with a PING: a pair of
-#   linear chirps (one up-sweep, one down-sweep) whose *order* is reversed on
-#   the frame that opens each lap of the carousel. Pings are found by a global
-#   matched-filter scan with no notion of "where the stream starts" — a
-#   decoder can walk in anywhere. The up/down chirp timing asymmetry gives a
-#   free, per-frame estimate of frequency offset and channel phase (the
-#   classic symmetric-sweep trick), so there is no drift-tracking loop and no
-#   frequency grid search: every frame re-synchronizes itself from scratch.
-#   After each ping comes a DATA field: a fixed number of BPSK symbols spread
-#   by a keyed noise carrier that depends on the *slot number*, not on
-#   absolute position in the file. Slot 0 always carries the (tiny) header;
-#   slots 1..N carry the FEC'd ciphertext, round-robin, lap after lap. A
-#   decoder just counts frames since the last boundary ping to know which
-#   slot it is looking at, and sums soft values across laps before running
-#   Viterbi — so gaps self-heal on the next lap, and partial audio still
-#   contributes.
+# Design:
+#   The timeline is cut into FRAMES. Each frame starts with a PING: an up-chirp
+#   and a down-chirp, in reversed order on the frame that opens each lap of the
+#   carousel. Pings are found by a global matched-filter scan, so a decoder can
+#   join anywhere. The up/down timing asymmetry gives a per-frame estimate of
+#   frequency offset and phase, so every frame re-syncs itself (no tracking
+#   loop, no frequency search). After each ping comes a DATA field: BPSK
+#   symbols spread by a keyed noise carrier that depends on the *slot number*.
+#   Slot 0 carries the header; slots 1..N carry the FEC'd ciphertext,
+#   round-robin, lap after lap. The decoder sums soft values across laps
+#   before Viterbi, so gaps self-heal on the next lap.
 #
-# What got dropped vs. a from-scratch design, on purpose, for leanness:
-#   - No global interleaver: carousel repetition across laps is the burst-
-#     error defense now, instead of bit-interleaving within one pass.
-#   - No Costas phase-tracking loop: each frame gets a fresh phase/frequency
-#     fix from its own ping pair instead of tracking one continuously.
-#   - No --simulate harness here; test channel degradation out-of-band.
-#   - No --max-freq-offset knob: offset is measured per frame, not searched.
-#
-# Known trade-off: chirps are a more *recognizable* shape in a spectrogram
-# than keyed noise would be (stealth-vs-robustness dial mentioned in the
-# design notes) — acceptable for this draft, worth revisiting later.
-#
-# Ping/data strength budget: pings ride PING_BOOST_DB louder than the data
-# field. Measured against broadband-noise covers, a ping at the *same*
-# level as the data symbols is only marginally louder than the cover's own
-# chance correlation with the chirp template — true pings and noise-only
-# peaks land in the same z-score range and detection gets unreliable. Since
-# losing a ping just costs one slot's worth of one lap (the carousel
-# recovers it next time around) while losing *sync entirely* costs the
-# whole message, it is worth spending more of the strength budget on the
-# beacon than on the payload.
+# Known trade-off: chirps are more recognizable in a spectrogram than keyed
+# noise would be, and are public: the password protects the content, not the
+# fact that something is hidden.
 # ─────────────────────────────────────────────────────────────────────────────
 
 import argparse, hashlib, hmac, os, sys, getpass, subprocess, tempfile
@@ -56,27 +32,31 @@ from math import gcd, ceil
 import numpy as np
 from scipy import signal
 from scipy.io import wavfile
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.exceptions import InvalidTag
 
 # ── constants ────────────────────────────────────────────────────────────────
 
 WORK_FS       = 8000
-DEFAULT_BAND  = (300.0, 2700.0)
+BAND          = (300.0, 2700.0)
 KDF_N         = 2 ** 14
 
 CHIRP_DUR     = 0.25                          # seconds, each leg of a ping
 CHIRP_LEN     = int(CHIRP_DUR * WORK_FS)
-CHIRP_F0      = 350.0                         # sweep range, inside DEFAULT_BAND
+CHIRP_F0      = 350.0                         # sweep range, inside BAND
 CHIRP_F1      = 2650.0
 PING_Z        = 7.0                           # ping-detect threshold (std devs)
-PING_BOOST_DB = 6.0                           # pings ride louder than data: see note below
+# Pings ride louder than data: at equal level they barely beat the cover's own
+# chance correlation with the chirp. A lost ping costs one slot for one lap;
+# lost sync costs the whole message.
+PING_BOOST_DB = 6.0
 LEG_SEARCH    = 40                            # samples, fine-align search window
 
 REDUNDANCY    = {"low": 128, "medium": 256, "high": 512}   # samples per data bit
 LEN_BYTES     = 4
 SALT_BYTES    = 8
-MAX_MESSAGE_BYTES = 16 * 1024          # see note at the nslots/max_seen guard below
+MAX_MESSAGE_BYTES = 16 * 1024
 HDR_BYTES     = LEN_BYTES + SALT_BYTES
 TAG_BYTES     = 16
 ENV_WIN       = 400
@@ -92,10 +72,9 @@ class WavyError(Exception):
 # ── keys & keyed pseudo-randomness ───────────────────────────────────────────
 
 def _pw(password):
-    """None and "" both mean 'no password'. The keys are then derived from an
-    empty string, i.e. they are public: the message is still FEC-coded and
-    integrity-checked, but anyone with this tool can find and read it. Use for
-    non-adversarial hiding only."""
+    """None and "" both mean 'no password': keys derive from an empty string,
+    i.e. they are public. The message is still FEC'd and integrity-checked,
+    but anyone with this tool can read it."""
     return b"" if password is None else password.encode()
 
 def carrier_key(password):
@@ -106,7 +85,6 @@ def subkey(ck, label):
     return hmac.new(ck, label, hashlib.sha256).digest()
 
 def keystream(key32, nbytes):
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
     enc = Cipher(algorithms.ChaCha20(key32, bytes(16)), mode=None).encryptor()
     return enc.update(bytes(nbytes))
 
@@ -115,22 +93,20 @@ def keyed_bits(key32, n):
     return np.unpackbits(ks)[:n]
 
 def msg_key_nonce(password, salt):
-    """Per-message AEAD key (32 B) and nonce (12 B), both derived from the
-    password and the random per-message salt via one scrypt call. Neither is
-    transmitted: the header carries only the salt. Safety invariant: the
-    (key, nonce) pair is unique per message because the salt is. A salt
-    collision under the same password would reuse both, hence the salt must
-    stay random (os.urandom) and not be shortened."""
+    """Per-message AEAD key (32 B) and nonce (12 B) from password + salt via
+    one scrypt call; only the salt is transmitted. The (key, nonce) pair is
+    unique per message because the salt is, so the salt must stay random
+    (os.urandom) and not be shortened."""
     km = hashlib.scrypt(_pw(password), salt=salt, n=KDF_N, r=8, p=1, dklen=44)
     return km[:32], km[32:]
 
 # ── DSP helpers ──────────────────────────────────────────────────────────────
 
-def bp_fir(band):
-    return signal.firwin(401, band, pass_zero=False, fs=WORK_FS)
+def bp_fir():
+    return signal.firwin(401, BAND, pass_zero=False, fs=WORK_FS)
 
-def bandpass(x, band):
-    return signal.fftconvolve(x, bp_fir(band), mode="same")
+def bandpass(x):
+    return signal.fftconvolve(x, bp_fir(), mode="same")
 
 def resample(x, fs_in, fs_out):
     if fs_in == fs_out:
@@ -143,14 +119,13 @@ def envelope(xb):
         signal.fftconvolve(xb ** 2, np.ones(ENV_WIN) / ENV_WIN, mode="same"), 0))
     return np.maximum(m, ENV_FLOOR * (np.sqrt(np.mean(xb ** 2)) + 1e-12))
 
-def slot_carrier(ck, slot, n, band):
-    """Keyed band-limited noise carrier for one carousel slot, unit RMS.
-    Keyed by slot number (not absolute sample position) so a decoder that
-    joins mid-stream can despread a slot the moment it knows its number."""
+def slot_carrier(ck, slot, n):
+    """Keyed band-limited noise carrier for one slot, unit RMS. Keyed by slot
+    number (not sample position) so a decoder joining mid-stream can despread
+    a slot as soon as it knows its number."""
     key = subkey(ck, b"pn:" + str(int(slot)).encode())
     chips = 1.0 - 2.0 * keyed_bits(key, n)
-    p = bandpass(chips, band)
-    return p / np.sqrt(np.sum(bp_fir(band) ** 2))
+    return bandpass(chips) / np.sqrt(np.sum(bp_fir() ** 2))
 
 # ── audio I/O ────────────────────────────────────────────────────────────────
 
@@ -186,7 +161,6 @@ def to_mono(x):
     return x.mean(axis=1) if x.ndim == 2 else x
 
 # ── forward error correction: K=7, r=1/2 convolutional code, soft Viterbi ────
-# (unchanged from the kometawav draft — this part already pulled its weight)
 
 _G1, _G2 = 0o133, 0o171
 
@@ -202,8 +176,10 @@ for _b in range(2):
         _reg = (int(_INBIT[_ns]) << 6) | int(_PRED[_b, _ns])
         _EXP[_b, _ns] = (1 - 2 * _parity(_reg & _G1), 1 - 2 * _parity(_reg & _G2))
 
-def conv_encode(bits):
-    bits = np.concatenate([np.asarray(bits, dtype=np.uint8), np.zeros(6, np.uint8)])
+def conv_encode(data):
+    """bytes -> coded bits (rate 1/2, 6 tail bits)."""
+    bits = np.concatenate([np.unpackbits(np.frombuffer(data, dtype=np.uint8)),
+                           np.zeros(6, np.uint8)])
     out, state = [], 0
     for u in bits:
         reg = (int(u) << 6) | state
@@ -212,6 +188,7 @@ def conv_encode(bits):
     return np.array(out, dtype=np.uint8)
 
 def viterbi_decode(soft):
+    """soft coded values -> bytes."""
     T = len(soft) // 2
     s1, s2 = soft[0::2][:T], soft[1::2][:T]
     pm = np.full(64, -1e18); pm[0] = 0.0
@@ -226,27 +203,18 @@ def viterbi_decode(soft):
     for t in range(T - 1, -1, -1):
         bits[t] = _INBIT[ns]
         ns = _PRED[int(dec[t, ns]), ns]
-    return bits[:-6]
-
-def fec_encode(data_bytes):
-    bits = np.unpackbits(np.frombuffer(data_bytes, dtype=np.uint8))
-    return conv_encode(bits)
-
-def fec_decode(soft):
-    bits = viterbi_decode(soft)
-    return np.packbits(bits).tobytes()
+    return np.packbits(bits[:-6]).tobytes()
 
 # ── pings: a chirp pair whose leg order marks carousel-lap boundaries ───────
 
 def _make_chirp(f0, f1, n):
     t = np.arange(n) / WORK_FS
     k = (f1 - f0) / (n / WORK_FS)
-    phase = 2 * np.pi * (f0 * t + 0.5 * k * t ** 2)
-    return np.sin(phase)
+    return np.sin(2 * np.pi * (f0 * t + 0.5 * k * t ** 2))
 
 _UP   = _make_chirp(CHIRP_F0, CHIRP_F1, CHIRP_LEN)
 _DOWN = _make_chirp(CHIRP_F1, CHIRP_F0, CHIRP_LEN)
-_UP_A, _DOWN_A = signal.hilbert(_UP), signal.hilbert(_DOWN)   # analytic refs for phase/freq fix
+_UP_A, _DOWN_A = signal.hilbert(_UP), signal.hilbert(_DOWN)   # analytic refs
 
 def ping_waveform(boundary):
     """boundary=True marks the frame that opens a carousel lap (slot 0)."""
@@ -255,10 +223,8 @@ def ping_waveform(boundary):
 def find_pings(xn, z_thresh=PING_Z):
     """Global matched-filter scan, no assumption about where the stream
     starts. Returns [(start_sample, boundary_flag, z), ...] time-ordered."""
-    normal = np.concatenate([_UP, _DOWN])
-    boundary = np.concatenate([_DOWN, _UP])
-    cn = signal.fftconvolve(xn, normal[::-1], mode="valid")
-    cb = signal.fftconvolve(xn, boundary[::-1], mode="valid")
+    cn = signal.fftconvolve(xn, ping_waveform(False)[::-1], mode="valid")
+    cb = signal.fftconvolve(xn, ping_waveform(True)[::-1], mode="valid")
     score = np.maximum(np.abs(cn), np.abs(cb))
     z = (score - score.mean()) / (score.std() + 1e-12)
     min_gap = int(1.5 * CHIRP_LEN)
@@ -290,10 +256,9 @@ def _leg_peak(xa, start_guess, ref_a, search=LEG_SEARCH):
     return best
 
 def ping_corrections(xa, start, boundary):
-    """From one ping's two legs, estimate (data_start, delta_hz, theta0)
-    using the classic symmetric-sweep CFO trick: a constant frequency
-    offset shifts the up-leg and down-leg matched-filter peaks by equal
-    and opposite amounts in time."""
+    """From one ping's two legs, estimate (data_start, delta_hz, theta0) with
+    the symmetric-sweep trick: a constant frequency offset shifts the up-leg
+    and down-leg peaks by equal and opposite amounts in time."""
     if boundary:
         up_guess, down_guess = start + CHIRP_LEN, start
     else:
@@ -309,12 +274,9 @@ def ping_corrections(xa, start, boundary):
     bw = CHIRP_F1 - CHIRP_F0
     delta_hz = (shift_up - shift_down) * bw / (2 * CHIRP_DUR)
     tau      = (shift_up + shift_down) / 2.0
-    # The leg search is on an integer-sample grid, so a +-1 sample jitter
-    # with zero true offset still produces a nonzero delta_hz (here, one
-    # sample quantum = bw/(2*CHIRP_DUR*WORK_FS) ~ 0.57 Hz). Over a long
-    # high-redundancy data field a *wrong* correction this size rotates the
-    # signal by several radians by the end of the frame and wrecks it, so
-    # deadband out anything too small to be real Doppler/SSB drift.
+    # The integer-sample leg search makes +-1 sample jitter look like a
+    # ~0.57 Hz offset; over a long data field a wrong correction that size
+    # rotates the signal by radians. Deadband anything below 2 quanta.
     quantum = bw / (2 * CHIRP_DUR * WORK_FS)
     if abs(delta_hz) < 2.0 * quantum:
         delta_hz = 0.0
@@ -333,33 +295,19 @@ def n_payload_slots(n):
 def frame_len_samples(L):
     return 2 * CHIRP_LEN + SYMS_PER_FRAME * L
 
-def capacity_bytes(n_frames_avail, L):
-    """Largest n (bytes) whose carousel (1 header slot + payload slots) fits
-    in one lap across n_frames_avail frames."""
-    def fits(n):
-        return 1 + n_payload_slots(n) <= n_frames_avail
-
-    if not fits(0):
-        return -1
-    lo, hi = 0, 1
-    while fits(hi):
-        lo, hi = hi, hi * 2
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if fits(mid):
-            lo = mid
-        else:
-            hi = mid - 1
-    return lo
+def capacity_bytes(n_frames):
+    """Largest message (bytes) whose carousel (1 header slot + payload slots)
+    fits in one lap of n_frames frames; negative if even the header won't."""
+    return ((n_frames - 1) * SYMS_PER_FRAME // 2 - 6) // 8 - TAG_BYTES
 
 # ── encoder ──────────────────────────────────────────────────────────────────
 
 def encode_audio(cover, fs, message, password, redundancy="medium",
-                 strength_db=DEFAULT_STRENGTH_DB, band=DEFAULT_BAND):
+                 strength_db=DEFAULT_STRENGTH_DB):
     if fs < WORK_FS:
         raise WavyError(f"cover sample rate {fs} Hz is below {WORK_FS} Hz")
     L = REDUNDANCY[redundancy]
-    mono8 = bandpass(resample(to_mono(cover), fs, WORK_FS), band)
+    mono8 = bandpass(resample(to_mono(cover), fs, WORK_FS))
 
     n = len(message)
     nslots = n_payload_slots(n)
@@ -378,8 +326,8 @@ def encode_audio(cover, fs, message, password, redundancy="medium",
     ct = ChaCha20Poly1305(key).encrypt(nonce, message, header)
     ck = carrier_key(password)
 
-    hdr_bits = fec_encode(header)                              # exactly SYMS_PER_FRAME
-    pay_bits = fec_encode(ct)
+    hdr_bits = conv_encode(header)                             # exactly SYMS_PER_FRAME
+    pay_bits = conv_encode(ct)
     pad = (-len(pay_bits)) % SYMS_PER_FRAME
     pay_bits = np.concatenate([pay_bits, np.zeros(pad, dtype=np.uint8)])
     slots = [hdr_bits] + [pay_bits[i * SYMS_PER_FRAME:(i + 1) * SYMS_PER_FRAME]
@@ -396,80 +344,59 @@ def encode_audio(cover, fs, message, password, redundancy="medium",
         w8[pos:pos + 2 * CHIRP_LEN] += g_ping * env[pos:pos + 2 * CHIRP_LEN] * ping
         dpos = pos + 2 * CHIRP_LEN
         sym = 1.0 - 2.0 * slots[slot_id].astype(float)
-        P = slot_carrier(ck, slot_id, SYMS_PER_FRAME * L, band)
+        P = slot_carrier(ck, slot_id, SYMS_PER_FRAME * L)
         w8[dpos:dpos + SYMS_PER_FRAME * L] += g * env[dpos:dpos + SYMS_PER_FRAME * L] * np.repeat(sym, L) * P
 
     w = resample(w8, WORK_FS, fs)
     w = np.pad(w, (0, max(0, len(cover) - len(w))))[:len(cover)]
-    out = cover + (w[:, None] if cover.ndim == 2 else w)
-    return out
+    return cover + (w[:, None] if cover.ndim == 2 else w)
 
 # ── decoder ──────────────────────────────────────────────────────────────────
 
-def _decode_with_L(xn, xa, pings, ck, L, password, log):
-    flen = frame_len_samples(L)
-    accum = {}           # slot_id -> np.array soft sums, len SYMS_PER_FRAME
-    counts = {}
+def _decode_with_L(xa, pings, ck, L, password, log):
+    accum = {}           # slot_id -> soft sums, len SYMS_PER_FRAME
     slot_id = None
+    need = SYMS_PER_FRAME * L
     for start, boundary, z in pings:
         if boundary:
             slot_id = 0
         elif slot_id is None:
-            continue        # haven't seen a lap boundary yet; can't number this frame safely
+            continue        # no lap boundary seen yet; can't number this frame
         else:
             slot_id += 1
 
         corr = ping_corrections(xa, start, boundary)
         if corr is None:
-            # LEG_SEARCH's fixed +-40 sample window didn't find a usable
-            # leg alignment near this ping (more clock drift than that
-            # window tolerates, most likely). This frame's data is simply
-            # skipped this lap rather than demodulated with a bad fix --
-            # the carousel should pick it up again next time around, but
-            # it's worth knowing this happened rather than it being silent.
-            log(f"  slot {slot_id}: no leg alignment near sample {start} (LEG_SEARCH window too narrow?), skipping this lap")
+            # Leg alignment failed (more drift than LEG_SEARCH tolerates):
+            # skip this frame; the carousel picks it up next lap.
+            log(f"  slot {slot_id}: no leg alignment near sample {start}, skipping this lap")
             continue
         data_start, delta_hz, theta0 = corr
-        need = SYMS_PER_FRAME * L
         if data_start < 0 or data_start + need > len(xa):
-            log(f"  slot {slot_id}: data field at sample {data_start} runs off the end of the recording, skipping")
+            log(f"  slot {slot_id}: data field at sample {data_start} runs off the end, skipping")
             continue
 
-        carrier_a = signal.hilbert(slot_carrier(ck, slot_id, need, (DEFAULT_BAND)))
-        seg = xa[data_start:data_start + need]
+        carrier_a = signal.hilbert(slot_carrier(ck, slot_id, need))
         t = np.arange(need) / WORK_FS
+        seg = xa[data_start:data_start + need]
         seg = seg * np.exp(-1j * 2 * np.pi * delta_hz * t) * np.exp(-1j * theta0)
         z_syms = (seg.reshape(SYMS_PER_FRAME, L) * np.conj(carrier_a.reshape(SYMS_PER_FRAME, L))).sum(axis=1)
-        soft = z_syms.real
-
-        if slot_id not in accum:
-            accum[slot_id] = np.zeros(SYMS_PER_FRAME)
-            counts[slot_id] = 0
-        accum[slot_id] += soft
-        counts[slot_id] += 1
+        accum[slot_id] = accum.get(slot_id, 0) + z_syms.real
 
     if 0 not in accum:
         return None
-    header = fec_decode(accum[0])
+    header = viterbi_decode(accum[0])
     n = int.from_bytes(header[:LEN_BYTES], "big")
     salt = header[LEN_BYTES:HDR_BYTES]
-    # A garbage header (wrong redundancy / wrong password) can claim an
-    # enormous message length, which would blow up the soft-bit array and
-    # Viterbi's trellis below. Two guards, cheapest first:
-    #  1. A flat sanity cap — this is a short-text tool, not a file-transfer
-    #     one, so reject anything absurd before computing slot counts at all.
-    #  2. The real safety bound: a genuine message can never need more
-    #     payload slots than we've actually seen *some* data for, so bail
-    #     the instant the claim exceeds what was physically observed in
-    #     this recording — this is what actually keeps memory use bounded
-    #     by file size no matter what MAX_MESSAGE_BYTES is set to.
-    if n < 0 or n > MAX_MESSAGE_BYTES:
+    # A garbage header (wrong redundancy/password) can claim an absurd length.
+    # Reject it by a flat cap, then by the real bound: a genuine message never
+    # needs more payload slots than were actually observed in this recording.
+    if n > MAX_MESSAGE_BYTES:
         return None
     nslots = n_payload_slots(n)
     max_seen = max((s for s in accum if s > 0), default=0)
-    if nslots < 0 or nslots > max_seen:
+    if nslots > max_seen:
         return None
-    pbits = pay_coded_bits(n)
     soft = np.zeros(nslots * SYMS_PER_FRAME)
     got_any = False
     for i in range(nslots):
@@ -478,33 +405,31 @@ def _decode_with_L(xn, xa, pings, ck, L, password, log):
             got_any = True
     if not got_any:
         return None
-    ct = fec_decode(soft[:pbits])
+    ct = viterbi_decode(soft[:pay_coded_bits(n)])
     log(f"  L={L}: header len={n} salt={salt.hex()} slots seen={sorted(accum)}")
     try:
         key, nonce = msg_key_nonce(password, salt)
-        return ChaCha20Poly1305(key).decrypt(nonce, bytes(ct), bytes(header))
+        return ChaCha20Poly1305(key).decrypt(nonce, ct, header)
     except InvalidTag:
         return None
 
-def decode_audio(x, fs, password, band=DEFAULT_BAND, verbose=False):
+def decode_audio(x, fs, password, verbose=False):
     log = (lambda s: print(s, file=sys.stderr)) if verbose else (lambda s: None)
     ck = carrier_key(password)
-    r8 = bandpass(resample(to_mono(x), fs, WORK_FS), band)
+    r8 = bandpass(resample(to_mono(x), fs, WORK_FS))
     xn = r8 / envelope(r8)
     pings = find_pings(xn)
     log(f"  found {len(pings)} candidate ping(s)")
     if not pings:
-        raise WavyError(f"no ping beacons found in band {band[0]:.0f}-{band[1]:.0f} Hz "
-                        f"(wrong --band? this file may have none, or the signal is too degraded)")
+        raise WavyError(f"no ping beacons found in band {BAND[0]:.0f}-{BAND[1]:.0f} Hz "
+                        "(this file may have none, or the signal is too degraded)")
     xa = signal.hilbert(xn)
     for name in ("medium", "high", "low"):
-        L = REDUNDANCY[name]
-        msg = _decode_with_L(xn, xa, pings, ck, L, password, log)
+        msg = _decode_with_L(xa, pings, ck, REDUNDANCY[name], password, log)
         if msg is not None:
             return msg
-    # Pings were found (so --band is almost certainly right, since that's
-    # what the beacon scan above just confirmed) but nothing decoded: the
-    # remaining explanations are a wrong password or payload-level damage.
+    # Pings were found, so the remaining explanations are a wrong password or
+    # payload-level damage.
     raise WavyError("pings found but no message decoded (wrong password, or the payload is too degraded)")
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -524,20 +449,11 @@ def get_password(confirm=False, no_password=False):
         raise WavyError("empty password (use --no-password for password-free mode)")
     return pw
 
-def parse_band(s):
-    try:
-        lo, hi = (float(v) for v in s.split("-"))
-        assert 0 < lo < hi < WORK_FS / 2
-        return lo, hi
-    except Exception:
-        raise WavyError("--band must look like 300-2700")
-
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="wavygravy", description="ping/carousel text-in-audio steganography")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(p):
-        p.add_argument("--band", default="300-2700", help="carrier band in Hz (must match on decode)")
         p.add_argument("-v", "--verbose", action="store_true")
         p.add_argument("--no-password", action="store_true",
                        help="no password: anyone with this tool can decode (must match on decode)")
@@ -565,32 +481,28 @@ def main(argv=None):
             for name, L in REDUNDANCY.items():
                 flen = frame_len_samples(L)
                 nframes = n8 // flen
-                cap = capacity_bytes(nframes, L)
+                cap = capacity_bytes(nframes)
+                head = f"  {name:<6} ({flen / WORK_FS:4.1f}s/frame, {nframes:>4} frames"
                 if cap < 0:
-                    print(f"  {name:<6} ({flen / WORK_FS:4.1f}s/frame, {nframes:>4} frames): "
-                          f"too short even for the header (needs >= 1 frame)")
-                    continue
-                total_slots = 1 + n_payload_slots(cap)
-                laps = nframes // total_slots
-                print(f"  {name:<6} ({flen / WORK_FS:4.1f}s/frame, {nframes:>4} frames, "
-                      f"{laps} lap(s)): {cap} bytes")
+                    print(f"{head}): too short even for the header (needs >= 1 frame)")
+                else:
+                    laps = nframes // (1 + n_payload_slots(cap))
+                    print(f"{head}, {laps} lap(s)): {cap} bytes")
             return 0
 
-        band = parse_band(a.band)
         if a.cmd == "encode":
             fs, cover = read_audio(a.cover)
             msg = open(a.message, "rb").read() if os.path.isfile(a.message) else a.message.encode("utf-8")
             pw = get_password(confirm=sys.stdin.isatty() and "WAVYGRAVY_PASSWORD" not in os.environ,
                               no_password=a.no_password)
-            out = encode_audio(cover, fs, msg, pw, a.redundancy, a.strength, band)
-            write_audio(a.output, fs, out)
+            write_audio(a.output, fs, encode_audio(cover, fs, msg, pw, a.redundancy, a.strength))
             print(f"encoded {len(msg)} bytes -> {a.output}"
                   + (" (no password: readable by anyone with this tool)" if a.no_password else ""),
                   file=sys.stderr)
             return 0
 
         fs, x = read_audio(a.input)
-        msg = decode_audio(x, fs, get_password(no_password=a.no_password), band, a.verbose)
+        msg = decode_audio(x, fs, get_password(no_password=a.no_password), a.verbose)
         if a.output:
             open(a.output, "wb").write(msg)
         else:
