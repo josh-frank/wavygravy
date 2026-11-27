@@ -39,14 +39,14 @@ wavygravy.py capacity cover.wav
 |------|---------|---------|
 | `--redundancy {low,medium,high}` | `medium` | Samples per data bit (128 / 256 / 512). Higher = more robust, longer frames, less capacity. |
 | `--strength DB` | `18.0` | How far below the cover level the data rides (dB). Higher = quieter but less robust; pings ride 6 dB above this. |
-<!-- | `--band LO-HI` | `300-2700` | Carrier band in Hz. **Must match on decode.** | -->
+| `--band LO-HI` | `300-2700` | Carrier band in Hz. **Must match on decode.** |
 | `-v`, `--verbose` | off | Verbose logging. |
 
 ### `decode input.wav [output.txt]`
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-<!-- | `--band LO-HI` | `300-2700` | Carrier band in Hz. Must match the encoder. | -->
+| `--band LO-HI` | `300-2700` | Carrier band in Hz. Must match the encoder. |
 | `-v`, `--verbose` | off | Log ping count, frame slot IDs, header details. |
 
 If `output.txt` is omitted, the decoded message is written to stdout.
@@ -58,9 +58,10 @@ Prints cover duration and the maximum message size (bytes) that fits at each red
 ## Notes
 
 - **Password** — read from `WAVYGRAVY_PASSWORD` if set, otherwise prompted. It drives both the ChaCha20-Poly1305 message key and the keyed noise carriers; wrong password = no message.
-<!-- - **Band mismatch** — decode fails silently (reports "no message found"). Keep `--band` consistent between encode and decode. -->
+- **Band mismatch** — decode fails silently (reports "no message found"). Keep `--band` consistent between encode and decode.
 - **Redundancy auto-try** — the decoder tries `medium`, `high`, then `low` automatically, so you usually don't need to pass `--redundancy` on decode (it doesn't take one).
 - **Carousel** — a lap is one pass of header + all payload slots; repeated laps let the decoder sum soft values across laps and self-heal gaps. The more audio you have relative to the message, the more robust it is.
 - **Max message** — `16 KiB` hard cap (`MAX_MESSAGE_BYTES`); this is a short-text tool, not a file transfer format.
 - **Cover requirements** — must be at least 8 kHz sample rate and long enough to fit the carousel; `capacity` tells you the limit.
 - **Trade-off** — chirp pings are visibly recognizable in a spectrogram. This is a deliberate robustness-vs-stealth dial for this draft.
+<!-- Add per-install local salt?? -->

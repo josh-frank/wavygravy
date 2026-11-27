@@ -44,13 +44,13 @@ from cryptography.exceptions import InvalidTag
 # ── constants ────────────────────────────────────────────────────────────────
 
 WORK_FS       = 8000
-BAND          = (300.0, 2700.0)
+DEFAULT_BAND  = (300.0, 2700.0)
 KDF_N         = 2 ** 17                       # scrypt: 128 MiB, ~0.4 s per password guess
 KDF_MAXMEM    = 256 * 2 ** 20                 # hashlib's default cap (32 MiB) is too small
 
 CHIRP_DUR     = 0.25                          # seconds, each leg of a ping
 CHIRP_LEN     = int(CHIRP_DUR * WORK_FS)
-CHIRP_F0      = 350.0                         # sweep range, inside BAND
+CHIRP_F0      = 350.0                         # sweep range, inside DEFAULT_BAND
 CHIRP_F1      = 2650.0
 PING_Z        = 7.0                           # ping-detect threshold (std devs)
 # Pings ride louder than data: at equal level they barely beat the cover's own
@@ -60,7 +60,7 @@ PING_BOOST_DB = 6.0
 LEG_SEARCH    = 40                            # samples, fine-align search window
 
 REDUNDANCY    = {"low": 128, "medium": 256, "high": 512}   # samples per data bit
-LEN_BYTES     = 4
+LEN_BYTES     = 2
 SALT_BYTES    = 8
 MAX_MESSAGE_BYTES = 16 * 1024
 HDR_BYTES     = LEN_BYTES + SALT_BYTES
@@ -111,11 +111,11 @@ def msg_key_nonce(master, salt):
 
 # ── DSP helpers ──────────────────────────────────────────────────────────────
 
-def bp_fir():
-    return signal.firwin(401, BAND, pass_zero=False, fs=WORK_FS)
+def bp_fir(band=DEFAULT_BAND):
+    return signal.firwin(401, band, pass_zero=False, fs=WORK_FS)
 
-def bandpass(x):
-    return signal.fftconvolve(x, bp_fir(), mode="same")
+def bandpass(x, band=DEFAULT_BAND):
+    return signal.fftconvolve(x, bp_fir(band), mode="same")
 
 def resample(x, fs_in, fs_out):
     if fs_in == fs_out:
@@ -128,13 +128,13 @@ def envelope(xb):
         signal.fftconvolve(xb ** 2, np.ones(ENV_WIN) / ENV_WIN, mode="same"), 0))
     return np.maximum(m, ENV_FLOOR * (np.sqrt(np.mean(xb ** 2)) + 1e-12))
 
-def slot_carrier(mk, slot, n):
+def slot_carrier(mk, slot, n, band=DEFAULT_BAND):
     """Keyed band-limited noise carrier for one slot, unit RMS. Keyed by slot
     number (not sample position) so a decoder joining mid-stream can despread
     a slot as soon as it knows its number."""
     key = derive(mk, b"wavygravy/pn/" + str(int(slot)).encode())
     chips = 1.0 - 2.0 * keyed_bits(key, n)
-    return bandpass(chips) / np.sqrt(np.sum(bp_fir() ** 2))
+    return bandpass(chips, band) / np.sqrt(np.sum(bp_fir(band) ** 2))
 
 # ── audio I/O ────────────────────────────────────────────────────────────────
 
@@ -187,7 +187,7 @@ for _b in range(2):
         _reg = (int(_INBIT[_ns]) << 6) | int(_PRED[_b, _ns])
         _EXP[_b, _ns] = (1 - 2 * _parity(_reg & _G1), 1 - 2 * _parity(_reg & _G2))
 
-def conv_encode(data):
+def fec_encode(data):
     """bytes -> coded bits (rate 1/2, 6 tail bits)."""
     bits = np.concatenate([np.unpackbits(np.frombuffer(data, dtype=np.uint8)),
                            np.zeros(6, np.uint8)])
@@ -198,7 +198,7 @@ def conv_encode(data):
         state = reg >> 1
     return np.array(out, dtype=np.uint8)
 
-def viterbi_decode(soft):
+def fec_decode(soft):
     """soft coded values -> bytes."""
     T = len(soft) // 2
     s1, s2 = soft[0::2][:T], soft[1::2][:T]
@@ -306,19 +306,21 @@ def n_payload_slots(n):
 def frame_len_samples(L):
     return 2 * CHIRP_LEN + SYMS_PER_FRAME * L
 
-def capacity_bytes(n_frames):
+def capacity_bytes(n_frames_avail, L=None):
     """Largest message (bytes) whose carousel (1 header slot + payload slots)
-    fits in one lap of n_frames frames; negative if even the header won't."""
-    return ((n_frames - 1) * SYMS_PER_FRAME // 2 - 6) // 8 - TAG_BYTES
+    fits in one lap of n_frames_avail frames; -1 if even the header won't.
+    (L is unused: the slot count doesn't depend on redundancy. Kept so existing
+    callers keep working.)"""
+    return max(-1, ((n_frames_avail - 1) * SYMS_PER_FRAME // 2 - 6) // 8 - TAG_BYTES)
 
 # ── encoder ──────────────────────────────────────────────────────────────────
 
 def encode_audio(cover, fs, message, password, redundancy="medium",
-                 strength_db=DEFAULT_STRENGTH_DB):
+                 strength_db=DEFAULT_STRENGTH_DB, band=DEFAULT_BAND):
     if fs < WORK_FS:
         raise WavyError(f"cover sample rate {fs} Hz is below {WORK_FS} Hz")
     L = REDUNDANCY[redundancy]
-    mono8 = bandpass(resample(to_mono(cover), fs, WORK_FS))
+    mono8 = bandpass(resample(to_mono(cover), fs, WORK_FS), band)
 
     n = len(message)
     nslots = n_payload_slots(n)
@@ -337,8 +339,8 @@ def encode_audio(cover, fs, message, password, redundancy="medium",
     key, nonce = msg_key_nonce(mk, salt)
     ct = ChaCha20Poly1305(key).encrypt(nonce, message, header)
 
-    hdr_bits = conv_encode(header)                             # exactly SYMS_PER_FRAME
-    pay_bits = conv_encode(ct)
+    hdr_bits = fec_encode(header)                             # exactly SYMS_PER_FRAME
+    pay_bits = fec_encode(ct)
     pad = (-len(pay_bits)) % SYMS_PER_FRAME
     pay_bits = np.concatenate([pay_bits, np.zeros(pad, dtype=np.uint8)])
     slots = [hdr_bits] + [pay_bits[i * SYMS_PER_FRAME:(i + 1) * SYMS_PER_FRAME]
@@ -355,7 +357,7 @@ def encode_audio(cover, fs, message, password, redundancy="medium",
         w8[pos:pos + 2 * CHIRP_LEN] += g_ping * env[pos:pos + 2 * CHIRP_LEN] * ping
         dpos = pos + 2 * CHIRP_LEN
         sym = 1.0 - 2.0 * slots[slot_id].astype(float)
-        P = slot_carrier(mk, slot_id, SYMS_PER_FRAME * L)
+        P = slot_carrier(mk, slot_id, SYMS_PER_FRAME * L, band)
         w8[dpos:dpos + SYMS_PER_FRAME * L] += g * env[dpos:dpos + SYMS_PER_FRAME * L] * np.repeat(sym, L) * P
 
     w = resample(w8, WORK_FS, fs)
@@ -365,7 +367,7 @@ def encode_audio(cover, fs, message, password, redundancy="medium",
 
 # ── decoder ──────────────────────────────────────────────────────────────────
 
-def _decode_with_L(xa, pings, mk, L, log):
+def _decode_with_L(xa, pings, mk, L, band, log):
     accum = {}           # slot_id -> soft sums, len SYMS_PER_FRAME
     slot_id = None
     need = SYMS_PER_FRAME * L
@@ -388,7 +390,7 @@ def _decode_with_L(xa, pings, mk, L, log):
             log(f"  slot {slot_id}: data field at sample {data_start} runs off the end, skipping")
             continue
 
-        carrier_a = signal.hilbert(slot_carrier(mk, slot_id, need))
+        carrier_a = signal.hilbert(slot_carrier(mk, slot_id, need, band))
         t = np.arange(need) / WORK_FS
         seg = xa[data_start:data_start + need]
         seg = seg * np.exp(-1j * 2 * np.pi * delta_hz * t) * np.exp(-1j * theta0)
@@ -397,7 +399,7 @@ def _decode_with_L(xa, pings, mk, L, log):
 
     if 0 not in accum:
         return None
-    header = viterbi_decode(accum[0])
+    header = fec_decode(accum[0])
     n = int.from_bytes(header[:LEN_BYTES], "big")
     salt = header[LEN_BYTES:HDR_BYTES]
     # A garbage header (wrong redundancy/password) can claim an absurd length.
@@ -417,7 +419,7 @@ def _decode_with_L(xa, pings, mk, L, log):
             got_any = True
     if not got_any:
         return None
-    ct = viterbi_decode(soft[:pay_coded_bits(n)])
+    ct = fec_decode(soft[:pay_coded_bits(n)])
     log(f"  L={L}: header len={n} salt={salt.hex()} slots seen={sorted(accum)}")
     try:
         key, nonce = msg_key_nonce(mk, salt)
@@ -425,19 +427,19 @@ def _decode_with_L(xa, pings, mk, L, log):
     except InvalidTag:
         return None
 
-def decode_audio(x, fs, password, verbose=False):
+def decode_audio(x, fs, password, band=DEFAULT_BAND, verbose=False):
     log = (lambda s: print(s, file=sys.stderr)) if verbose else (lambda s: None)
     mk = master_key(password)
-    r8 = bandpass(resample(to_mono(x), fs, WORK_FS))
+    r8 = bandpass(resample(to_mono(x), fs, WORK_FS), band)
     xn = r8 / envelope(r8)
     pings = find_pings(xn)
     log(f"  found {len(pings)} candidate ping(s)")
     if not pings:
-        raise WavyError(f"no ping beacons found in band {BAND[0]:.0f}-{BAND[1]:.0f} Hz "
-                        "(this file may have none, or the signal is too degraded)")
+        raise WavyError(f"no ping beacons found in band {band[0]:.0f}-{band[1]:.0f} Hz "
+                        "(wrong --band? this file may have none, or the signal is too degraded)")
     xa = signal.hilbert(xn)
     for name in ("medium", "high", "low"):
-        msg = _decode_with_L(xa, pings, mk, REDUNDANCY[name], log)
+        msg = _decode_with_L(xa, pings, mk, REDUNDANCY[name], band, log)
         if msg is not None:
             return msg
     # Pings were found, so the remaining explanations are a wrong password or
@@ -474,11 +476,20 @@ def read_message(arg):
         raise WavyError(f"cannot read message: {ex}")
     return arg.encode("utf-8")
 
+def parse_band(s):
+    try:
+        lo, hi = (float(v) for v in s.split("-"))
+        assert 0 < lo < hi < WORK_FS / 2
+        return lo, hi
+    except Exception:
+        raise WavyError("--band must look like 300-2700")
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="wavygravy", description="ping/carousel text-in-audio steganography")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(p):
+        p.add_argument("--band", default="300-2700", help="carrier band in Hz (must match on decode)")
         p.add_argument("-v", "--verbose", action="store_true")
         p.add_argument("--no-password", action="store_true",
                        help="no password: anyone with this tool can decode (must match on decode)")
@@ -522,14 +533,14 @@ def main(argv=None):
             fs, cover = read_audio(a.cover)
             msg = read_message(a.message)
             pw = get_password(confirm=True, no_password=a.no_password)
-            write_audio(a.output, fs, encode_audio(cover, fs, msg, pw, a.redundancy, a.strength))
+            write_audio(a.output, fs, encode_audio(cover, fs, msg, pw, a.redundancy, a.strength, parse_band(a.band)))
             print(f"encoded {len(msg)} bytes -> {a.output}"
                   + (" (no password: readable by anyone with this tool)" if a.no_password else ""),
                   file=sys.stderr)
             return 0
 
         fs, x = read_audio(a.input)
-        msg = decode_audio(x, fs, get_password(no_password=a.no_password), a.verbose)
+        msg = decode_audio(x, fs, get_password(no_password=a.no_password), parse_band(a.band), a.verbose)
         if a.output:
             open(a.output, "wb").write(msg)
         else:
