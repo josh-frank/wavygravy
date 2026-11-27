@@ -9,6 +9,9 @@ suite stays quick. The cover is ~40 s, which is enough for two full carousel
 laps of the default test message (1 header slot + 4 payload slots).
 """
 import os
+import re
+import stat
+import hashlib
 
 import numpy as np
 import pytest
@@ -46,6 +49,17 @@ def encode_to_file(cover_path, out_path, message=MESSAGE, password=PASSWORD,
 def decode_file(path, password=PASSWORD):
     fs, x = wg.read_audio(path)
     return wg.decode_audio(x, fs, password)
+
+
+def use_password(monkeypatch, pw):
+    """Passwords come from an interactive prompt only (no env var, no argv): answer it."""
+    monkeypatch.setattr(wg.getpass, "getpass", lambda prompt="": pw)
+
+
+def forbid_prompt(monkeypatch):
+    def boom(prompt=""):
+        raise AssertionError("the password prompt must not be reached here")
+    monkeypatch.setattr(wg.getpass, "getpass", boom)
 
 
 def rms(x):
@@ -219,7 +233,7 @@ def test_different_password_full_roundtrip(tmp, cover_path):
 # ── 8. literal message strings ───────────────────────────────────────────────
 
 def test_cli_literal_string_roundtrip(tmp, cover_path, monkeypatch, capfd):
-    monkeypatch.setenv("WAVYGRAVY_PASSWORD", PASSWORD)
+    use_password(monkeypatch, PASSWORD)
     out = str(tmp / "cli_out.wav")
     assert wg.main(["encode", cover_path, "stop spying on me", out, "--redundancy", RED,
                           "--strength", str(STRENGTH)]) == 0
@@ -229,14 +243,14 @@ def test_cli_literal_string_roundtrip(tmp, cover_path, monkeypatch, capfd):
 
 
 def test_cli_decode_to_file(tmp, out_a_path, monkeypatch):
-    monkeypatch.setenv("WAVYGRAVY_PASSWORD", PASSWORD)
+    use_password(monkeypatch, PASSWORD)
     txt = tmp / "decoded.txt"
     assert wg.main(["decode", out_a_path, str(txt)]) == 0
     assert txt.read_bytes() == MESSAGE.encode()
 
 
 def test_cli_wrong_password_exit_code_1(out_a_path, monkeypatch, capsys):
-    monkeypatch.setenv("WAVYGRAVY_PASSWORD", OTHER_PASSWORD)
+    use_password(monkeypatch, OTHER_PASSWORD)
     assert wg.main(["decode", out_a_path]) == 1
     assert "wavygravy:" in capsys.readouterr().err
 
@@ -470,7 +484,7 @@ def test_null_password_works_from_half_window(nopw_path):
 
 
 def test_cli_no_password_roundtrip(tmp, cover_path, monkeypatch, capfd):
-    monkeypatch.delenv("WAVYGRAVY_PASSWORD", raising=False)
+    forbid_prompt(monkeypatch)                    # --no-password must never prompt
     out = str(tmp / "cli_nopw.wav")
     assert wg.main(["encode", "--no-password", cover_path, "hello", out,
                     "--redundancy", RED, "--strength", str(STRENGTH)]) == 0
@@ -479,14 +493,19 @@ def test_cli_no_password_roundtrip(tmp, cover_path, monkeypatch, capfd):
     assert capfd.readouterr().out == "hello"
 
 
-def test_cli_no_password_conflicts_with_env_password(out_a_path, monkeypatch, capsys):
+def test_env_password_is_ignored(out_a_path, monkeypatch, capsys):
+    """WAVYGRAVY_PASSWORD was removed (env vars leak to other processes): the right password
+    in the environment must not decode, and --no-password must not complain about it."""
     monkeypatch.setenv("WAVYGRAVY_PASSWORD", PASSWORD)
+    use_password(monkeypatch, OTHER_PASSWORD)                 # the prompt is the only source
+    assert wg.main(["decode", out_a_path]) == 1
+    assert "wavygravy:" in capsys.readouterr().err
     assert wg.main(["decode", "--no-password", out_a_path]) == 1
-    assert "conflicts" in capsys.readouterr().err
+    assert "conflicts" not in capsys.readouterr().err
 
 
 def test_cli_decode_without_flag_on_password_free_file_fails(nopw_path, monkeypatch, capsys):
-    monkeypatch.setenv("WAVYGRAVY_PASSWORD", PASSWORD)
+    use_password(monkeypatch, PASSWORD)
     assert wg.main(["decode", nopw_path]) == 1
 
 
@@ -515,3 +534,288 @@ def test_capacity_bytes_monotonic_and_fits():
             assert 1 + wg.n_payload_slots(cap) <= frames
             assert 1 + wg.n_payload_slots(cap + 1) > frames
         prev = cap
+
+
+# ── optional keyfile (*.secret): a secret scrypt salt ────────────────────────
+
+SECRET_A = bytes(range(32))
+SECRET_B = bytes(range(1, 33))
+
+
+@pytest.fixture(scope="module")
+def keyed_path(tmp, cover_path):
+    """PASSWORD + SECRET_A."""
+    return encode_to_file(cover_path, tmp / "keyed.wav", secret=SECRET_A)
+
+
+@pytest.fixture(scope="module")
+def keyonly_path(tmp, cover_path):
+    """SECRET_A and no password (keyfile-only mode)."""
+    return encode_to_file(cover_path, tmp / "keyonly.wav", password=None, secret=SECRET_A)
+
+
+def decode_keyed(path, password=PASSWORD, secret=SECRET_A):
+    fs, x = wg.read_audio(path)
+    return wg.decode_audio(x, fs, password, secret=secret)
+
+
+def write_keyfile(path, text, mode=0o600):
+    path.write_bytes(text if isinstance(text, bytes) else text.encode())
+    os.chmod(path, mode)
+    return str(path)
+
+
+def test_keyfile_roundtrip(keyed_path):
+    assert decode_keyed(keyed_path) == MESSAGE.encode()
+
+
+def test_keyfile_wrong_keyfile_fails(keyed_path):
+    with pytest.raises(wg.WavyError):
+        decode_keyed(keyed_path, secret=SECRET_B)
+
+
+def test_keyfile_missing_keyfile_fails(keyed_path):
+    with pytest.raises(wg.WavyError):
+        decode_keyed(keyed_path, secret=None)
+
+
+def test_keyfile_right_keyfile_wrong_password_fails(keyed_path):
+    with pytest.raises(wg.WavyError):
+        decode_keyed(keyed_path, password=OTHER_PASSWORD)
+
+
+def test_keyfile_not_accepted_on_a_file_made_without_one(out_a_path):
+    with pytest.raises(wg.WavyError):
+        decode_keyed(out_a_path)                              # right password, extra keyfile
+
+
+def test_keyfile_only_roundtrip(keyonly_path):
+    assert decode_keyed(keyonly_path, password=None) == MESSAGE.encode()
+    assert decode_keyed(keyonly_path, password="") == MESSAGE.encode()
+
+
+def test_keyfile_only_is_not_readable_in_public_no_password_mode(keyonly_path):
+    with pytest.raises(wg.WavyError):
+        decode_keyed(keyonly_path, password=None, secret=None)
+
+
+def test_keyfile_only_wrong_keyfile_fails(keyonly_path):
+    with pytest.raises(wg.WavyError):
+        decode_keyed(keyonly_path, password=None, secret=SECRET_B)
+
+
+SALT_1 = bytes(range(8))
+SALT_2 = bytes(range(1, 9))
+
+
+def test_secret_must_be_32_bytes():
+    for bad in (b"", b"short", bytes(31), bytes(33)):
+        with pytest.raises(wg.WavyError):
+            wg.master_key(PASSWORD, SALT_1, bad)
+
+
+def test_master_key_derivation_is_pinned():
+    """Spec pin: scrypt over (password, sha256(label | keyfile length | keyfile | salt))."""
+    def expect(secret):
+        sec = secret or b""
+        kdf_salt = hashlib.sha256(b"wavygravy/master/v3" + bytes([len(sec)]) + sec + SALT_1).digest()
+        return hashlib.scrypt(PASSWORD.encode(), salt=kdf_salt, n=2 ** 17, r=8, p=1,
+                              dklen=32, maxmem=256 * 2 ** 20)
+    assert wg.master_key(PASSWORD, SALT_1) == expect(None)
+    assert wg.master_key(PASSWORD, SALT_1, SECRET_A) == expect(SECRET_A)
+
+
+def test_master_key_depends_on_salt_password_and_keyfile():
+    keys = {
+        wg.master_key(PASSWORD, SALT_1),
+        wg.master_key(PASSWORD, SALT_2),                       # other message
+        wg.master_key(OTHER_PASSWORD, SALT_1),                 # other password
+        wg.master_key(PASSWORD, SALT_1, SECRET_A),             # with a keyfile
+        wg.master_key(PASSWORD, SALT_1, SECRET_B),             # with another keyfile
+    }
+    assert len(keys) == 5
+
+
+# ── public header, keyed payload ─────────────────────────────────────────────
+
+def test_scrypt_salt_is_per_message_and_matches_between_encode_and_decode(tmp, cover_path, monkeypatch):
+    """The scrypt salt used to be a fixed public constant. It must now differ per message, and
+    the decoder must rediscover the encoder's salt from the file alone."""
+    seen = []
+    real = hashlib.scrypt
+    def spy(*a, **k):
+        seen.append(k["salt"])
+        return real(*a, **k)
+    monkeypatch.setattr(wg.hashlib, "scrypt", spy)
+    p1 = encode_to_file(cover_path, tmp / "salt1.wav")
+    p2 = encode_to_file(cover_path, tmp / "salt2.wav")
+    enc1, enc2 = seen[0], seen[1]
+    seen.clear()
+    assert decode_file(p1) == MESSAGE.encode()
+    assert seen == [enc1] and enc1 != enc2
+
+
+def test_header_is_readable_without_password_or_keyfile(keyed_path, capsys):
+    """Slot 0 is under a public carrier: with the wrong password AND no keyfile the decode fails,
+    but the header (length, salt) is still read, which is what lets the salt be per-message."""
+    fs, x = wg.read_audio(keyed_path)
+    with pytest.raises(wg.WavyError):
+        wg.decode_audio(x, fs, OTHER_PASSWORD, verbose=True)
+    assert f"len={len(MESSAGE.encode())}" in capsys.readouterr().err
+
+
+def test_header_salt_is_the_one_in_the_file(tmp, cover_path, monkeypatch, capsys):
+    monkeypatch.setattr(wg.os, "urandom", lambda n: bytes(range(n)))      # pin the salt
+    path = encode_to_file(cover_path, tmp / "pinned_salt.wav")
+    fs, x = wg.read_audio(path)
+    with pytest.raises(wg.WavyError):
+        wg.decode_audio(x, fs, OTHER_PASSWORD, verbose=True)
+    assert "salt=" + bytes(range(wg.SALT_BYTES)).hex() in capsys.readouterr().err
+
+
+def test_header_carrier_is_public_payload_carriers_are_per_message():
+    n = wg.SYMS_PER_FRAME * 128
+    corr = lambda a, b: abs(float(np.dot(a, b) / np.sqrt(np.dot(a, a) * np.dot(b, b))))
+    h = wg.slot_carrier(wg.HEADER_KEY, 0, n)
+    assert np.array_equal(h, wg.slot_carrier(wg.HEADER_KEY, 0, n))          # fixed, key-free
+    m1, m2 = wg.master_key(PASSWORD, SALT_1), wg.master_key(PASSWORD, SALT_2)
+    p1, p1b, p2 = (wg.slot_carrier(m1, 1, n), wg.slot_carrier(m1, 1, n), wg.slot_carrier(m2, 1, n))
+    assert np.array_equal(p1, p1b)                                          # deterministic per message
+    assert corr(p1, p2) < 0.05                                              # same password, other message: unrelated
+    assert corr(p1, wg.slot_carrier(m1, 2, n)) < 0.05                       # other slot: unrelated
+    assert corr(p1, h) < 0.05                                               # payload is not the public header carrier
+
+
+# keygen / load_keyfile / fingerprint
+
+def test_keygen_writes_64_hex_chars_with_private_mode(tmp):
+    path = tmp / "k1.secret"
+    fp = wg.keygen(str(path))
+    assert re.fullmatch(r"[0-9a-f]{64}\n", path.read_text())
+    assert re.fullmatch(r"[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}", fp)
+    if os.name == "posix":
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    assert len(wg.load_keyfile(str(path))) == 32
+
+
+def test_keygen_never_overwrites(tmp):
+    path = tmp / "k2.secret"
+    wg.keygen(str(path))
+    before = path.read_bytes()
+    with pytest.raises(wg.WavyError, match="already exists"):
+        wg.keygen(str(path))
+    assert path.read_bytes() == before
+
+
+def test_keygen_makes_different_keys(tmp):
+    wg.keygen(str(tmp / "k3.secret")); wg.keygen(str(tmp / "k4.secret"))
+    assert (tmp / "k3.secret").read_bytes() != (tmp / "k4.secret").read_bytes()
+
+
+def test_fingerprint_is_stable_short_and_does_not_leak_the_key(tmp):
+    path = tmp / "k5.secret"
+    fp = wg.keygen(str(path))
+    key = wg.load_keyfile(str(path))
+    assert wg.fingerprint(key) == fp == wg.fingerprint(key)
+    assert fp.replace("-", "") not in key.hex()
+    assert wg.fingerprint(SECRET_A) != wg.fingerprint(SECRET_B)
+
+
+def test_load_keyfile_accepts_uppercase_and_trailing_whitespace(tmp):
+    p = write_keyfile(tmp / "up.secret", SECRET_A.hex().upper() + " \r\n")
+    assert wg.load_keyfile(p) == SECRET_A
+
+
+@pytest.mark.parametrize("text", [
+    "",                                   # empty
+    "hunter2",                            # a typed word
+    "abcd",                               # valid hex, far too short
+    "z" * 64,                             # right length, not hex
+    SECRET_A.hex()[:-2],                  # one byte short
+    SECRET_A.hex() + "00",                # one byte long
+    " ".join(f"{b:02x}" for b in SECRET_A),   # 32 bytes of hex but with spaces
+    b"\xff\xfe\x00\x01" * 20,             # binary
+])
+def test_load_keyfile_rejects_non_keyfiles(tmp, text):
+    p = write_keyfile(tmp / "bad.secret", text)
+    with pytest.raises(wg.WavyError, match="not a wavygravy keyfile"):
+        wg.load_keyfile(p)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="permission bits are POSIX-only")
+@pytest.mark.parametrize("mode", [0o644, 0o640, 0o604, 0o666])
+def test_load_keyfile_rejects_group_or_world_accessible(tmp, mode):
+    p = write_keyfile(tmp / "loose.secret", SECRET_A.hex(), mode=mode)
+    with pytest.raises(wg.WavyError, match="chmod 600"):
+        wg.load_keyfile(p)
+
+
+def test_load_keyfile_missing_file(tmp):
+    with pytest.raises(wg.WavyError, match="cannot read keyfile"):
+        wg.load_keyfile(str(tmp / "nope.secret"))
+
+
+# CLI
+
+def test_cli_keygen_and_fingerprint(tmp, capfd):
+    path = str(tmp / "cli1.secret")
+    assert wg.main(["keygen", path]) == 0
+    created = capfd.readouterr().err
+    assert wg.main(["fingerprint", path]) == 0
+    fp = capfd.readouterr().out.strip()
+    assert re.fullmatch(r"[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}", fp) and fp in created
+    assert wg.main(["keygen", path]) == 1                     # refuses to overwrite
+
+
+def test_cli_keyfile_roundtrip_with_password(tmp, cover_path, monkeypatch, capfd):
+    key = write_keyfile(tmp / "cli2.secret", SECRET_A.hex() + "\n")
+    use_password(monkeypatch, PASSWORD)
+    out = str(tmp / "cli_keyed.wav")
+    assert wg.main(["encode", "--keyfile", key, cover_path, "with a keyfile", out,
+                    "--redundancy", RED, "--strength", str(STRENGTH)]) == 0
+    capfd.readouterr()
+    assert wg.main(["decode", "--keyfile", key, out]) == 0
+    assert capfd.readouterr().out == "with a keyfile"
+    # same password, no keyfile: must not decode, and the error says keyfile too
+    assert wg.main(["decode", out]) == 1
+    assert "keyfile" in capfd.readouterr().err
+
+
+def test_cli_keyfile_only_never_prompts(tmp, cover_path, monkeypatch, capfd):
+    key = write_keyfile(tmp / "cli3.secret", SECRET_A.hex() + "\n")
+    forbid_prompt(monkeypatch)
+    out = str(tmp / "cli_keyonly.wav")
+    assert wg.main(["encode", "--keyfile", key, "--no-password", cover_path, "scripted", out,
+                    "--redundancy", RED, "--strength", str(STRENGTH)]) == 0
+    assert "keyfile-only" in capfd.readouterr().err
+    assert wg.main(["decode", "--keyfile", key, "--no-password", out]) == 0
+    assert capfd.readouterr().out == "scripted"
+    assert wg.main(["decode", "--no-password", out]) == 1     # no keyfile: unreadable
+
+
+def test_cli_wrong_keyfile_exit_code_1(tmp, cover_path, monkeypatch, capfd):
+    good = write_keyfile(tmp / "cli4.secret", SECRET_A.hex())
+    other = write_keyfile(tmp / "cli5.secret", SECRET_B.hex())
+    forbid_prompt(monkeypatch)
+    out = str(tmp / "cli_wrongkey.wav")
+    assert wg.main(["encode", "--keyfile", good, "--no-password", cover_path, "x", out,
+                    "--redundancy", RED, "--strength", str(STRENGTH)]) == 0
+    capfd.readouterr()
+    assert wg.main(["decode", "--keyfile", other, "--no-password", out]) == 1
+    assert "keyfile" in capfd.readouterr().err
+
+
+def test_cli_bad_keyfile_fails_before_the_password_prompt(tmp, cover_path, monkeypatch, capsys):
+    bad = write_keyfile(tmp / "cli6.secret", "hunter2")
+    forbid_prompt(monkeypatch)                                # would raise if reached
+    assert wg.main(["encode", "--keyfile", bad, cover_path, "x", str(tmp / "never.wav")]) == 1
+    assert "not a wavygravy keyfile" in capsys.readouterr().err
+    assert not (tmp / "never.wav").exists()
+
+
+def test_cli_verbose_prints_keyfile_fingerprint_not_the_key(tmp, keyed_path, monkeypatch, capsys):
+    key = write_keyfile(tmp / "cli7.secret", SECRET_A.hex())
+    use_password(monkeypatch, PASSWORD)
+    assert wg.main(["decode", "-v", "--keyfile", key, keyed_path]) == 0
+    err = capsys.readouterr().err
+    assert wg.fingerprint(SECRET_A) in err and SECRET_A.hex() not in err

@@ -3,10 +3,14 @@
 # wavygravy.py — hide a short UTF-8 message in an audio file using self-locating
 # "ping" beacons and a repeating carousel of coded chunks.
 #
-#   WAVYGRAVY_PASSWORD=... wavygravy.py encode cover.wav "stop spying on me" out.wav
-#   WAVYGRAVY_PASSWORD=... wavygravy.py decode out.wav [message.txt]
+#   wavygravy.py encode cover.wav "stop spying on me" out.wav     (prompts for password)
+#   wavygravy.py encode cover.wav - out.wav < msg.txt             ('-' stdin, '@file' file)
+#   wavygravy.py decode out.wav [message.txt]
 #   wavygravy.py encode --no-password cover.wav "hello" out.wav   (password-free)
-#   wavygravy.py decode --no-password out.wav
+#   wavygravy.py keygen hq.secret                  (optional shared secret keyfile)
+#   wavygravy.py encode --keyfile hq.secret cover.wav "hi" out.wav
+#   wavygravy.py encode --keyfile hq.secret --no-password ...     (keyfile-only: scriptable)
+#   wavygravy.py fingerprint hq.secret             (compare by phone to confirm same file)
 #   wavygravy.py capacity cover.wav
 #
 # Design:
@@ -16,17 +20,24 @@
 #   join anywhere. The up/down timing asymmetry gives a per-frame estimate of
 #   frequency offset and phase, so every frame re-syncs itself (no tracking
 #   loop, no frequency search). After each ping comes a DATA field: BPSK
-#   symbols spread by a keyed noise carrier that depends on the *slot number*.
-#   Slot 0 carries the header; slots 1..N carry the FEC'd ciphertext,
-#   round-robin, lap after lap. The decoder sums soft values across laps
-#   before Viterbi, so gaps self-heal on the next lap.
+#   symbols spread by a noise carrier that depends on the *slot number*.
+#   Slot 0 carries the header (length + a random per-message salt) under a PUBLIC
+#   carrier, so anyone can read it first. Slots 1..N carry the FEC'd ciphertext
+#   under carriers keyed by the password, round-robin, lap after lap. The decoder
+#   sums soft values across laps before Viterbi, so gaps self-heal on the next lap.
 #
-# Keys: one scrypt call (N=2^17) gives a master key; carriers and the per-message
-# AEAD key/nonce come from it by HKDF. The encryption is ChaCha20-Poly1305.
+# Keys: one scrypt call (N=2^17) over (password, that message's salt, optional
+# keyfile) gives a master key; the payload carriers and the AEAD key/nonce come
+# from it by HKDF. The encryption is ChaCha20-Poly1305. Because the salt is
+# per-message, password guesses can't be precomputed across files and no two
+# messages share carriers. An optional keyfile (32 random bytes, `keygen`) is
+# mixed into the scrypt salt: with it, stolen audio can't be password-guessed at
+# all. Losing the keyfile loses every message made with it.
 #
-# Known trade-off: chirps are more recognizable in a spectrogram than keyed
-# noise would be, and are public: the password protects the content, not the
-# fact that something is hidden.
+# Known trade-offs: chirps are more recognizable in a spectrogram than keyed
+# noise would be, and are public. The header is public too (the message length,
+# which the lap length already gives away to within a slot, and a random salt).
+# The password protects the content, not the fact that something is hidden.
 # ─────────────────────────────────────────────────────────────────────────────
 
 import argparse, hashlib, os, sys, getpass, subprocess, tempfile
@@ -47,6 +58,9 @@ WORK_FS       = 8000
 DEFAULT_BAND  = (300.0, 2700.0)
 KDF_N         = 2 ** 17                       # scrypt: 128 MiB, ~0.4 s per password guess
 KDF_MAXMEM    = 256 * 2 ** 20                 # hashlib's default cap (32 MiB) is too small
+KDF_LABEL     = b"wavygravy/master/v3"
+HEADER_KEY    = hashlib.sha256(b"wavygravy/public-header/v3").digest()   # slot 0 carrier: public
+KEY_BYTES     = 32                            # keyfile size
 
 CHIRP_DUR     = 0.25                          # seconds, each leg of a ping
 CHIRP_LEN     = int(CHIRP_DUR * WORK_FS)
@@ -83,13 +97,58 @@ def _pw(password):
     but anyone with this tool can read it."""
     return b"" if password is None else password.encode()
 
-def master_key(password):
-    """The only slow step; everything else is cheap HKDF off this. The scrypt
-    salt is a fixed public constant because the carrier key is needed to read
-    the header, which is where the per-message salt lives. So the cost factor
-    is the only defence against precomputed password tables."""
-    return hashlib.scrypt(_pw(password), salt=b"wavygravy/master/v2", n=KDF_N,
-                          r=8, p=1, dklen=32, maxmem=KDF_MAXMEM)
+def master_key(password, salt, secret=None):
+    """The only slow step; everything else is cheap HKDF off this. `salt` is the
+    random per-message salt read from the public header, so a password guess
+    costs one scrypt *per file* and can't be precomputed across files. With a
+    keyfile (`secret`) the scrypt salt also contains a secret: without it, no
+    password guess can even be tested."""
+    if secret is not None and len(secret) != KEY_BYTES:
+        raise WavyError(f"keyfile secret must be {KEY_BYTES} bytes")
+    sec = b"" if secret is None else secret
+    kdf_salt = hashlib.sha256(KDF_LABEL + bytes([len(sec)]) + sec + salt).digest()
+    return hashlib.scrypt(_pw(password), salt=kdf_salt, n=KDF_N, r=8, p=1,
+                          dklen=32, maxmem=KDF_MAXMEM)
+
+def fingerprint(secret):
+    """Short non-secret ID ('xxxx-xxxx-xxxx') for comparing keyfiles by phone."""
+    h = hashlib.sha256(b"wavygravy/fingerprint/v1" + secret).hexdigest()[:12]
+    return "-".join(h[i:i + 4] for i in range(0, 12, 4))
+
+def load_keyfile(path):
+    """Read a keyfile written by keygen: exactly 64 hex characters. Anything else
+    (a typed word, a binary file) is refused, so a weak keyfile can't be made by
+    accident. On POSIX, refuses files other users can read, as ssh does."""
+    bad = WavyError(f"{path} is not a wavygravy keyfile (expected 64 hex characters; "
+                    "make one with: wavygravy keygen NAME.secret)")
+    try:
+        if os.name == "posix" and os.stat(path).st_mode & 0o077:
+            raise WavyError(f"keyfile {path} is accessible by other users; run: chmod 600 {path}")
+        with open(path, "rb") as f:
+            raw = f.read(200)
+    except OSError as ex:
+        raise WavyError(f"cannot read keyfile: {ex}")
+    try:
+        txt = raw.decode("ascii").strip()
+        key = bytes.fromhex(txt)
+    except ValueError:                                    # includes UnicodeDecodeError
+        raise bad
+    if len(txt) != 2 * KEY_BYTES:                         # fromhex tolerates spaces
+        raise bad
+    return key
+
+def keygen(path):
+    """Write a fresh random keyfile (mode 0600, never overwrites); returns its fingerprint."""
+    key = os.urandom(KEY_BYTES)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        raise WavyError(f"{path} already exists (refusing to overwrite a keyfile)")
+    except OSError as ex:
+        raise WavyError(f"cannot create keyfile: {ex}")
+    with os.fdopen(fd, "w") as f:
+        f.write(key.hex() + "\n")
+    return fingerprint(key)
 
 def derive(master, info, length=32, salt=None):
     return HKDF(algorithm=hashes.SHA256(), length=length, salt=salt, info=info).derive(master)
@@ -102,11 +161,11 @@ def keyed_bits(key32, n):
     ks = np.frombuffer(keystream(key32, (n + 7) // 8), dtype=np.uint8)
     return np.unpackbits(ks)[:n]
 
-def msg_key_nonce(master, salt):
-    """Per-message AEAD key (32 B) and nonce (12 B), bound to the transmitted
-    salt. The salt must stay random (os.urandom): a repeat under one password
-    repeats key and nonce together."""
-    km = derive(master, b"wavygravy/aead", 44, salt)
+def msg_key_nonce(master):
+    """Per-message AEAD key (32 B) and nonce (12 B). `master` already contains the
+    message's random salt, so (key, nonce) repeats only if the salt does: it
+    must stay random (os.urandom), never shortened or reused."""
+    km = derive(master, b"wavygravy/aead", 44)
     return km[:32], km[32:]
 
 # ── DSP helpers ──────────────────────────────────────────────────────────────
@@ -129,7 +188,8 @@ def envelope(xb):
     return np.maximum(m, ENV_FLOOR * (np.sqrt(np.mean(xb ** 2)) + 1e-12))
 
 def slot_carrier(mk, slot, n, band=DEFAULT_BAND):
-    """Keyed band-limited noise carrier for one slot, unit RMS. Keyed by slot
+    """Band-limited noise carrier for one slot, unit RMS, from key material `mk`
+    (HEADER_KEY for slot 0, the master key for payload slots). Keyed by slot
     number (not sample position) so a decoder joining mid-stream can despread
     a slot as soon as it knows its number."""
     key = derive(mk, b"wavygravy/pn/" + str(int(slot)).encode())
@@ -316,7 +376,7 @@ def capacity_bytes(n_frames_avail, L=None):
 # ── encoder ──────────────────────────────────────────────────────────────────
 
 def encode_audio(cover, fs, message, password, redundancy="medium",
-                 strength_db=DEFAULT_STRENGTH_DB, band=DEFAULT_BAND):
+                 strength_db=DEFAULT_STRENGTH_DB, band=DEFAULT_BAND, secret=None):
     if fs < WORK_FS:
         raise WavyError(f"cover sample rate {fs} Hz is below {WORK_FS} Hz")
     L = REDUNDANCY[redundancy]
@@ -333,10 +393,10 @@ def encode_audio(cover, fs, message, password, redundancy="medium",
             f"at '{redundancy}' redundancy ({total_slots * flen / WORK_FS:.1f}s) but the "
             f"cover has {len(mono8) / WORK_FS:.1f}s of room ({max_frames} frames fit)")
 
-    mk = master_key(password)
     salt = os.urandom(SALT_BYTES)
+    mk = master_key(password, salt, secret)
     header = n.to_bytes(LEN_BYTES, "big") + salt
-    key, nonce = msg_key_nonce(mk, salt)
+    key, nonce = msg_key_nonce(mk)
     ct = ChaCha20Poly1305(key).encrypt(nonce, message, header)
 
     hdr_bits = fec_encode(header)                             # exactly SYMS_PER_FRAME
@@ -357,7 +417,7 @@ def encode_audio(cover, fs, message, password, redundancy="medium",
         w8[pos:pos + 2 * CHIRP_LEN] += g_ping * env[pos:pos + 2 * CHIRP_LEN] * ping
         dpos = pos + 2 * CHIRP_LEN
         sym = 1.0 - 2.0 * slots[slot_id].astype(float)
-        P = slot_carrier(mk, slot_id, SYMS_PER_FRAME * L, band)
+        P = slot_carrier(HEADER_KEY if slot_id == 0 else mk, slot_id, SYMS_PER_FRAME * L, band)
         w8[dpos:dpos + SYMS_PER_FRAME * L] += g * env[dpos:dpos + SYMS_PER_FRAME * L] * np.repeat(sym, L) * P
 
     w = resample(w8, WORK_FS, fs)
@@ -367,10 +427,10 @@ def encode_audio(cover, fs, message, password, redundancy="medium",
 
 # ── decoder ──────────────────────────────────────────────────────────────────
 
-def _decode_with_L(xa, pings, mk, L, band, log):
-    accum = {}           # slot_id -> soft sums, len SYMS_PER_FRAME
-    slot_id = None
-    need = SYMS_PER_FRAME * L
+def _frames(xa, pings, L, log):
+    """Password-independent sync for every usable ping: [(slot_id, data_start,
+    delta_hz, theta0), ...]. Slot numbers count pings up from each lap boundary."""
+    frames, slot_id, need = [], None, SYMS_PER_FRAME * L
     for start, boundary, z in pings:
         if boundary:
             slot_id = 0
@@ -389,47 +449,61 @@ def _decode_with_L(xa, pings, mk, L, band, log):
         if data_start < 0 or data_start + need > len(xa):
             log(f"  slot {slot_id}: data field at sample {data_start} runs off the end, skipping")
             continue
+        frames.append((slot_id, data_start, delta_hz, theta0))
+    return frames
 
-        carrier_a = signal.hilbert(slot_carrier(mk, slot_id, need, band))
-        t = np.arange(need) / WORK_FS
-        seg = xa[data_start:data_start + need]
-        seg = seg * np.exp(-1j * 2 * np.pi * delta_hz * t) * np.exp(-1j * theta0)
-        z_syms = (seg.reshape(SYMS_PER_FRAME, L) * np.conj(carrier_a.reshape(SYMS_PER_FRAME, L))).sum(axis=1)
-        accum[slot_id] = accum.get(slot_id, 0) + z_syms.real
+def _despread(xa, frame, key, L, band):
+    """Soft symbol values for one frame's data field under carrier key material `key`."""
+    slot_id, data_start, delta_hz, theta0 = frame
+    need = SYMS_PER_FRAME * L
+    carrier_a = signal.hilbert(slot_carrier(key, slot_id, need, band))
+    t = np.arange(need) / WORK_FS
+    seg = xa[data_start:data_start + need]
+    seg = seg * np.exp(-1j * 2 * np.pi * delta_hz * t) * np.exp(-1j * theta0)
+    z_syms = (seg.reshape(SYMS_PER_FRAME, L) * np.conj(carrier_a.reshape(SYMS_PER_FRAME, L))).sum(axis=1)
+    return z_syms.real
 
-    if 0 not in accum:
+def _decode_with_L(xa, pings, password, secret, L, band, log):
+    frames = _frames(xa, pings, L, log)
+
+    # Pass 1: the header sits under a public carrier, so it needs no key.
+    hdr = [_despread(xa, f, HEADER_KEY, L, band) for f in frames if f[0] == 0]
+    if not hdr:
         return None
-    header = fec_decode(accum[0])
+    header = fec_decode(sum(hdr))
     n = int.from_bytes(header[:LEN_BYTES], "big")
     salt = header[LEN_BYTES:HDR_BYTES]
-    # A garbage header (wrong redundancy/password) can claim an absurd length.
+    # A garbage header (wrong redundancy level) can claim an absurd length.
     # Reject it by a flat cap, then by the real bound: a genuine message never
     # needs more payload slots than were actually observed in this recording.
+    # (This also keeps the slow scrypt below from running on garbage.)
     if n > MAX_MESSAGE_BYTES:
         return None
     nslots = n_payload_slots(n)
-    max_seen = max((s for s in accum if s > 0), default=0)
-    if nslots > max_seen:
+    seen = sorted({f[0] for f in frames if f[0] > 0})
+    if nslots > (seen[-1] if seen else 0):
         return None
+    log(f"  L={L}: header len={n} salt={salt.hex()} slots seen={[0] + seen}")
+
+    # Pass 2: payload carriers are keyed by scrypt(password, this file's salt, keyfile).
+    mk = master_key(password, salt, secret)
     soft = np.zeros(nslots * SYMS_PER_FRAME)
     got_any = False
-    for i in range(nslots):
-        if (i + 1) in accum:
-            soft[i * SYMS_PER_FRAME:(i + 1) * SYMS_PER_FRAME] = accum[i + 1]
+    for f in frames:
+        if 0 < f[0] <= nslots:
+            soft[(f[0] - 1) * SYMS_PER_FRAME:f[0] * SYMS_PER_FRAME] += _despread(xa, f, mk, L, band)
             got_any = True
     if not got_any:
         return None
     ct = fec_decode(soft[:pay_coded_bits(n)])
-    log(f"  L={L}: header len={n} salt={salt.hex()} slots seen={sorted(accum)}")
     try:
-        key, nonce = msg_key_nonce(mk, salt)
+        key, nonce = msg_key_nonce(mk)
         return ChaCha20Poly1305(key).decrypt(nonce, ct, header)
     except InvalidTag:
         return None
 
-def decode_audio(x, fs, password, band=DEFAULT_BAND, verbose=False):
+def decode_audio(x, fs, password, band=DEFAULT_BAND, verbose=False, secret=None):
     log = (lambda s: print(s, file=sys.stderr)) if verbose else (lambda s: None)
-    mk = master_key(password)
     r8 = bandpass(resample(to_mono(x), fs, WORK_FS), band)
     xn = r8 / envelope(r8)
     pings = find_pings(xn)
@@ -439,29 +513,36 @@ def decode_audio(x, fs, password, band=DEFAULT_BAND, verbose=False):
                         "(wrong --band? this file may have none, or the signal is too degraded)")
     xa = signal.hilbert(xn)
     for name in ("medium", "high", "low"):
-        msg = _decode_with_L(xa, pings, mk, REDUNDANCY[name], band, log)
+        msg = _decode_with_L(xa, pings, password, secret, REDUNDANCY[name], band, log)
         if msg is not None:
             return msg
     # Pings were found, so the remaining explanations are a wrong password or
-    # payload-level damage.
-    raise WavyError("pings found but no message decoded (wrong password, or the payload is too degraded)")
+    # keyfile, or payload-level damage.
+    raise WavyError("pings found but no message decoded (wrong password or keyfile, "
+                    "or the payload is too degraded)")
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def get_password(confirm=False, no_password=False):
+    """Interactive prompt only. There is deliberately no env-var or argv route:
+    both leak to other processes. For unattended use, use a keyfile with
+    --no-password."""
     if no_password:
-        if os.environ.get("WAVYGRAVY_PASSWORD"):
-            raise WavyError("--no-password conflicts with WAVYGRAVY_PASSWORD (unset one of them)")
         return ""
-    pw = os.environ.get("WAVYGRAVY_PASSWORD")
-    if pw:
-        return pw
     pw = getpass.getpass("password: ")
     if confirm and getpass.getpass("again:    ") != pw:
         raise WavyError("passwords do not match")
     if not pw:
         raise WavyError("empty password (use --no-password for password-free mode)")
     return pw
+
+def keyfile_from_args(a):
+    if not a.keyfile:
+        return None
+    secret = load_keyfile(a.keyfile)
+    if a.verbose:
+        print(f"  keyfile fingerprint {fingerprint(secret)}", file=sys.stderr)
+    return secret
 
 def read_message(arg):
     """'-' reads stdin and '@path' reads a file, both of which keep the message
@@ -491,8 +572,11 @@ def main(argv=None):
     def common(p):
         p.add_argument("--band", default="300-2700", help="carrier band in Hz (must match on decode)")
         p.add_argument("-v", "--verbose", action="store_true")
+        p.add_argument("--keyfile", metavar="FILE.secret",
+                       help="secret keyfile from `keygen` (must match on decode)")
         p.add_argument("--no-password", action="store_true",
-                       help="no password: anyone with this tool can decode (must match on decode)")
+                       help="no password (must match on decode). With --keyfile: keyfile-only. "
+                            "Without: anyone with this tool can decode")
 
     e = sub.add_parser("encode", help="encode <cover.wav> <message|-|@file> <output.wav>")
     e.add_argument("cover")
@@ -511,8 +595,24 @@ def main(argv=None):
     c = sub.add_parser("capacity", help="capacity <cover.wav>")
     c.add_argument("cover")
 
+    k = sub.add_parser("keygen", help="keygen <NAME.secret>: create a random keyfile")
+    k.add_argument("path")
+    f = sub.add_parser("fingerprint", help="fingerprint <NAME.secret>: ID to compare by phone")
+    f.add_argument("path")
+
     a = ap.parse_args(argv)
     try:
+        if a.cmd == "keygen":
+            fp = keygen(a.path)
+            print(f"created {a.path}   fingerprint {fp}\n"
+                  "Give the other party a copy over a trusted channel and compare fingerprints by phone.\n"
+                  "Back it up: if it is lost, every message made with it is unrecoverable.", file=sys.stderr)
+            return 0
+
+        if a.cmd == "fingerprint":
+            print(fingerprint(load_keyfile(a.path)))
+            return 0
+
         if a.cmd == "capacity":
             fs, x = read_audio(a.cover)
             n8 = int(len(to_mono(x)) * WORK_FS / fs)
@@ -532,15 +632,21 @@ def main(argv=None):
         if a.cmd == "encode":
             fs, cover = read_audio(a.cover)
             msg = read_message(a.message)
+            secret = keyfile_from_args(a)             # before the prompt: fail fast on a bad file
             pw = get_password(confirm=True, no_password=a.no_password)
-            write_audio(a.output, fs, encode_audio(cover, fs, msg, pw, a.redundancy, a.strength, parse_band(a.band)))
-            print(f"encoded {len(msg)} bytes -> {a.output}"
-                  + (" (no password: readable by anyone with this tool)" if a.no_password else ""),
-                  file=sys.stderr)
+            write_audio(a.output, fs, encode_audio(cover, fs, msg, pw, a.redundancy, a.strength,
+                                                    parse_band(a.band), secret))
+            note = ""
+            if a.no_password:
+                note = (" (keyfile-only: no password)" if secret
+                        else " (no password: readable by anyone with this tool)")
+            print(f"encoded {len(msg)} bytes -> {a.output}{note}", file=sys.stderr)
             return 0
 
         fs, x = read_audio(a.input)
-        msg = decode_audio(x, fs, get_password(no_password=a.no_password), parse_band(a.band), a.verbose)
+        secret = keyfile_from_args(a)
+        msg = decode_audio(x, fs, get_password(no_password=a.no_password), parse_band(a.band),
+                           a.verbose, secret)
         if a.output:
             open(a.output, "wb").write(msg)
         else:
